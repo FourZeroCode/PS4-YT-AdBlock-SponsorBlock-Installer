@@ -68,6 +68,7 @@ del /s /q /f $(IntDir)\*.oelf</NMakeCleanCommandLine>
     <ClInclude Include="..\_common\graphics.h" />
     <ClInclude Include="..\_common\log.h" />
     <ClInclude Include="controller.h" />
+    <ClInclude Include="version.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

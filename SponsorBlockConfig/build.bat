@@ -7,7 +7,12 @@ if not defined OO_PS4_TOOLCHAIN (
 
 Rem Package information
 set PKG_TITLE="PS4 YT AdBlock + SponsorBlock"
-set PKG_VERSION="01.00"
+set PKG_VERSION=
+for /f "tokens=3" %%A in ('findstr /b /c:"#define APP_RELEASE_VERSION" version.h') do set PKG_VERSION="%%~A"
+if not defined PKG_VERSION (
+    echo ERROR: APP_RELEASE_VERSION is missing from version.h.
+    exit /b 1
+)
 set PKG_ASSETS="assets"
 set PKG_TITLE_ID="SBCK00001"
 set PKG_CONTENT_ID="IV0000-SBCK00001_00-SPONSORBLOCKCF01"

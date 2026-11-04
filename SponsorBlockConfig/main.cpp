@@ -21,8 +21,12 @@
 #include "../_common/graphics.h"
 #include "../_common/log.h"
 #include "controller.h"
+#include "version.h"
 
 static char downloadFailureReason[128] = "not attempted";
+
+// OpenOrbis exposes the progress-bar target as an integer value (0).
+#define ORBIS_MSG_DIALOG_PROGRESSBAR_TARGET_BAR_DEFAULT 0
 
 #define FRAME_WIDTH 1920
 #define FRAME_HEIGHT 1080
@@ -30,6 +34,10 @@ static char downloadFailureReason[128] = "not attempted";
 #define CATEGORY_COUNT 12
 #define CONFIG_DIRECTORY "/data/youtube"
 #define CONFIG_PATH "/data/youtube/config.json"
+
+#define LATEST_APP_RELEASE_API_URL "https://api.github.com/repos/FourZeroCode/PS4-YT-AdBlock-SponsorBlock-Installer/releases/latest"
+#define APP_UPDATE_TEMP_PATH "/data/pkg/SponsorBlockConfig-update.pkg.download"
+#define APP_UPDATE_PKG_PATH "/data/pkg/SponsorBlockConfig-update.pkg"
 
 std::stringstream debugLogStream;
 int frameID = 0;
@@ -1269,6 +1277,821 @@ cleanup:
     return ok;
 }
 
+static bool jsonReadString(const std::string &json, size_t quotePosition, std::string &value)
+{
+    if (quotePosition >= json.size() || json[quotePosition] != '"')
+        return false;
+
+    value.clear();
+    for (size_t i = quotePosition + 1; i < json.size(); ++i)
+    {
+        char c = json[i];
+        if (c == '"')
+            return true;
+        if (c == '\\')
+        {
+            if (++i >= json.size()) return false;
+            char escaped = json[i];
+            if (escaped == '"' || escaped == '\\' || escaped == '/') value += escaped;
+            else if (escaped == 'n') value += '\n';
+            else if (escaped == 'r') value += '\r';
+            else if (escaped == 't') value += '\t';
+            else return false;
+        }
+        else
+        {
+            value += c;
+        }
+    }
+    return false;
+}
+
+static bool jsonGetString(const std::string &json, const char *key, std::string &value)
+{
+    std::string quotedKey = "\"";
+    quotedKey += key;
+    quotedKey += "\"";
+    size_t position = json.find(quotedKey);
+    if (position == std::string::npos) return false;
+    position = json.find(':', position + quotedKey.size());
+    if (position == std::string::npos) return false;
+    ++position;
+    while (position < json.size() &&
+           (json[position] == ' ' || json[position] == '\n' ||
+            json[position] == '\r' || json[position] == '\t'))
+        ++position;
+    return jsonReadString(json, position, value);
+}
+
+static bool parseReleaseVersion(const std::string &version, unsigned int parts[3])
+{
+    size_t position = 0;
+    if (!version.empty() && (version[0] == 'v' || version[0] == 'V'))
+        position = 1;
+
+    parts[0] = parts[1] = parts[2] = 0;
+    for (int part = 0; part < 2; ++part)
+    {
+        if (position >= version.size() || version[position] < '0' || version[position] > '9')
+            return false;
+        unsigned int value = 0;
+        while (position < version.size() && version[position] >= '0' && version[position] <= '9')
+        {
+            unsigned int digit = (unsigned int)(version[position] - '0');
+            if (value > (0xFFFFFFFFU - digit) / 10U) return false;
+            value = value * 10U + digit;
+            ++position;
+        }
+        parts[part] = value;
+        if (part == 1 && position == version.size())
+            return true;
+        if (position >= version.size() || version[position] != '.') return false;
+        ++position;
+    }
+
+    if (position == version.size())
+        return false;
+
+    if (version[position] < '0' || version[position] > '9')
+        return false;
+    unsigned int patch = 0;
+    while (position < version.size() && version[position] >= '0' && version[position] <= '9')
+    {
+        unsigned int digit = (unsigned int)(version[position] - '0');
+        if (patch > (0xFFFFFFFFU - digit) / 10U) return false;
+        patch = patch * 10U + digit;
+        ++position;
+    }
+    if (position != version.size()) return false;
+    parts[2] = patch;
+    return true;
+}
+
+static bool isVersionNewer(const std::string &remoteVersion)
+{
+    unsigned int localParts[3];
+    unsigned int remoteParts[3];
+    if (!parseReleaseVersion(APP_RELEASE_VERSION, localParts) ||
+        !parseReleaseVersion(remoteVersion, remoteParts))
+        return false;
+
+    for (int i = 0; i < 3; ++i)
+    {
+        if (remoteParts[i] > localParts[i]) return true;
+        if (remoteParts[i] < localParts[i]) return false;
+    }
+    return false;
+}
+
+static bool extractPkgAsset(const std::string &json, std::string &downloadUrl)
+{
+    size_t assetsKey = json.find("\"assets\"");
+    if (assetsKey == std::string::npos) return false;
+    size_t arrayStart = json.find('[', assetsKey);
+    if (arrayStart == std::string::npos) return false;
+
+    bool inString = false;
+    bool escaped = false;
+    int objectDepth = 0;
+    size_t objectStart = std::string::npos;
+    for (size_t i = arrayStart + 1; i < json.size(); ++i)
+    {
+        char c = json[i];
+        if (inString)
+        {
+            if (escaped) escaped = false;
+            else if (c == '\\') escaped = true;
+            else if (c == '"') inString = false;
+            continue;
+        }
+        if (c == '"')
+        {
+            inString = true;
+            continue;
+        }
+        if (c == '{')
+        {
+            if (objectDepth == 0) objectStart = i;
+            ++objectDepth;
+        }
+        else if (c == '}' && objectDepth > 0)
+        {
+            --objectDepth;
+            if (objectDepth == 0 && objectStart != std::string::npos)
+            {
+                std::string asset = json.substr(objectStart, i - objectStart + 1);
+                std::string name;
+                std::string url;
+                if (jsonGetString(asset, "name", name) &&
+                    jsonGetString(asset, "browser_download_url", url) &&
+                    name.size() >= 4 &&
+                    (name.compare(name.size() - 4, 4, ".pkg") == 0 ||
+                     name.compare(name.size() - 4, 4, ".PKG") == 0) &&
+                    url.compare(0, 8, "https://") == 0)
+                {
+                    downloadUrl = url;
+                    return true;
+                }
+                objectStart = std::string::npos;
+            }
+        }
+        else if (c == ']' && objectDepth == 0)
+        {
+            break;
+        }
+    }
+    return false;
+}
+
+static bool httpGetToString(const char *url, std::string &response,
+                            char *errorText, size_t errorTextSize)
+{
+    int netPoolId = -1;
+    int sslContextId = -1;
+    int httpContextId = -1;
+    int templateId = -1;
+    int connectionId = -1;
+    int requestId = -1;
+    int statusCode = 0;
+    bool ok = false;
+    bool gotFinalResponse = false;
+    typedef int32_t (*HttpSetResponseHeaderMaxSizeFn)(int32_t, uint32_t);
+    HttpSetResponseHeaderMaxSizeFn setResponseHeaderMaxSize =
+        reinterpret_cast<HttpSetResponseHeaderMaxSizeFn>(&sceHttpSetResponseHeaderMaxSize);
+    char currentUrl[2048];
+    char buffer[4096];
+    response.clear();
+    snprintf(currentUrl, sizeof(currentUrl), "%s", url);
+
+    if (sceSysmoduleLoadModuleInternal(ORBIS_SYSMODULE_INTERNAL_NET) < 0 ||
+        sceSysmoduleLoadModuleInternal(ORBIS_SYSMODULE_INTERNAL_HTTP) < 0 ||
+        sceSysmoduleLoadModuleInternal(ORBIS_SYSMODULE_INTERNAL_SSL) < 0)
+    {
+        snprintf(errorText, errorTextSize, "network modules could not be loaded");
+        goto cleanup;
+    }
+    sceNetInit();
+    netPoolId = sceNetPoolCreate("SponsorBlockUpdateNet", 16 * 1024, 0);
+    if (netPoolId < 0)
+    {
+        snprintf(errorText, errorTextSize, "network pool failed (%d)", netPoolId);
+        goto cleanup;
+    }
+    sslContextId = sceSslInit(512 * 1024);
+    if (sslContextId < 0)
+    {
+        snprintf(errorText, errorTextSize, "SSL init failed (%d)", sslContextId);
+        goto cleanup;
+    }
+    httpContextId = sceHttpInit(netPoolId, sslContextId, 512 * 1024);
+    if (httpContextId < 0)
+    {
+        snprintf(errorText, errorTextSize, "HTTP init failed (%d)", httpContextId);
+        goto cleanup;
+    }
+    templateId = sceHttpCreateTemplate(httpContextId, "SponsorBlockConfig-Updater/1.0",
+                                       ORBIS_HTTP_VERSION_1_1, 1);
+    if (templateId < 0 || sceHttpsSetSslCallback(templateId, verifyGitHubCertificate, NULL) < 0)
+    {
+        snprintf(errorText, errorTextSize, "HTTP template or certificate setup failed");
+        goto cleanup;
+    }
+    if (setResponseHeaderMaxSize(templateId, 64 * 1024) < 0)
+    {
+        snprintf(errorText, errorTextSize, "HTTP response header limit setup failed");
+        goto cleanup;
+    }
+
+    for (int redirectCount = 0; redirectCount <= 5; ++redirectCount)
+    {
+        connectionId = sceHttpCreateConnectionWithURL(templateId, currentUrl, 1);
+        if (connectionId < 0)
+        {
+            snprintf(errorText, errorTextSize, "HTTP connection failed (%d)", connectionId);
+            goto cleanup;
+        }
+        requestId = sceHttpCreateRequestWithURL(connectionId, ORBIS_METHOD_GET, currentUrl, 0);
+        if (requestId < 0)
+        {
+            snprintf(errorText, errorTextSize, "HTTP request failed (%d)", requestId);
+            goto cleanup;
+        }
+        if (sceHttpAddRequestHeader(requestId, "User-Agent", "SponsorBlockConfig-Updater", 0) < 0 ||
+            sceHttpAddRequestHeader(requestId, "Accept", "application/vnd.github+json", 0) < 0)
+        {
+            snprintf(errorText, errorTextSize, "could not set GitHub API request headers");
+            goto cleanup;
+        }
+        if (sceHttpSendRequest(requestId, NULL, 0) < 0)
+        {
+            int httpError = 0;
+            sceHttpGetLastErrno(requestId, &httpError);
+            snprintf(errorText, errorTextSize, "HTTP send failed (%d)", httpError);
+            goto cleanup;
+        }
+        if (sceHttpGetStatusCode(requestId, &statusCode) < 0)
+        {
+            snprintf(errorText, errorTextSize, "could not read HTTP status");
+            goto cleanup;
+        }
+        if (statusCode == 200)
+        {
+            gotFinalResponse = true;
+            break;
+        }
+        if (statusCode == 301 || statusCode == 302 || statusCode == 303 ||
+            statusCode == 307 || statusCode == 308)
+        {
+            char redirectUrl[2048];
+            if (redirectCount == 5 || !extractRedirectLocation(requestId, redirectUrl, sizeof(redirectUrl)))
+            {
+                snprintf(errorText, errorTextSize, "unsafe or excessive HTTP redirects");
+                goto cleanup;
+            }
+            sceHttpDeleteRequest(requestId);
+            requestId = -1;
+            sceHttpDeleteConnection(connectionId);
+            connectionId = -1;
+            snprintf(currentUrl, sizeof(currentUrl), "%s", redirectUrl);
+            continue;
+        }
+        snprintf(errorText, errorTextSize, "GitHub returned HTTP %d", statusCode);
+        goto cleanup;
+    }
+    if (!gotFinalResponse)
+    {
+        snprintf(errorText, errorTextSize, "HTTP redirect limit exceeded");
+        goto cleanup;
+    }
+
+    for (;;)
+    {
+        int bytesRead = sceHttpReadData(requestId, buffer, sizeof(buffer));
+        if (bytesRead == 0) break;
+        if (bytesRead < 0)
+        {
+            snprintf(errorText, errorTextSize, "release information read failed (%d)", bytesRead);
+            goto cleanup;
+        }
+        if (response.size() + (size_t)bytesRead > 256 * 1024)
+        {
+            snprintf(errorText, errorTextSize, "GitHub release response was too large");
+            goto cleanup;
+        }
+        response.append(buffer, (size_t)bytesRead);
+    }
+    if (response.empty())
+    {
+        snprintf(errorText, errorTextSize, "GitHub returned an empty release response");
+        goto cleanup;
+    }
+    ok = true;
+    errorText[0] = '\0';
+
+cleanup:
+    if (requestId >= 0) sceHttpDeleteRequest(requestId);
+    if (connectionId >= 0) sceHttpDeleteConnection(connectionId);
+    if (templateId >= 0) sceHttpDeleteTemplate(templateId);
+    if (httpContextId >= 0) sceHttpTerm(httpContextId);
+    if (sslContextId >= 0) sceSslTerm();
+    if (netPoolId >= 0) sceNetPoolDestroy(netPoolId);
+    return ok;
+}
+
+// Native PS4 progress dialog used only by the SponsorBlockConfig PKG updater.
+static bool openAppUpdateProgressDialog(char *errorText, size_t errorTextSize)
+{
+    if (!ensureDialogServices(errorText, errorTextSize))
+        return false;
+
+    int rc = sceMsgDialogInitialize();
+    if (rc < 0)
+    {
+        snprintf(errorText, errorTextSize, "Progress dialog initialization failed (%d)", rc);
+        return false;
+    }
+
+    OrbisMsgDialogParam param;
+    OrbisMsgDialogProgressBarParam progressParam;
+    memset(&param, 0, sizeof(param));
+    memset(&progressParam, 0, sizeof(progressParam));
+
+    param.baseParam.size = (uint32_t)sizeof(OrbisCommonDialogBaseParam);
+    param.baseParam.magic = (uint32_t)(ORBIS_COMMON_DIALOG_MAGIC_NUMBER +
+                                       (uint64_t)&param.baseParam);
+    param.size = sizeof(OrbisMsgDialogParam);
+    param.mode = ORBIS_MSG_DIALOG_MODE_PROGRESS_BAR;
+    progressParam.barType = ORBIS_MSG_DIALOG_PROGRESSBAR_TYPE_PERCENTAGE;
+    progressParam.msg = "Preparing SponsorBlockConfig update...";
+    param.progBarParam = &progressParam;
+
+    rc = sceMsgDialogOpen(&param);
+    if (rc < 0)
+    {
+        sceMsgDialogTerminate();
+        snprintf(errorText, errorTextSize, "Could not open progress dialog (%d)", rc);
+        return false;
+    }
+
+    sceMsgDialogProgressBarSetMsg(ORBIS_MSG_DIALOG_PROGRESSBAR_TARGET_BAR_DEFAULT,
+                                  "Preparing SponsorBlockConfig update...");
+    sceMsgDialogProgressBarSetValue(ORBIS_MSG_DIALOG_PROGRESSBAR_TARGET_BAR_DEFAULT, 0);
+    return true;
+}
+
+static void updateAppUpdateProgress(const char *message, int percent)
+{
+    if (percent < 0) percent = 0;
+    if (percent > 100) percent = 100;
+    sceMsgDialogProgressBarSetMsg(ORBIS_MSG_DIALOG_PROGRESSBAR_TARGET_BAR_DEFAULT, message);
+    sceMsgDialogProgressBarSetValue(ORBIS_MSG_DIALOG_PROGRESSBAR_TARGET_BAR_DEFAULT, percent);
+}
+
+static void closeAppUpdateProgressDialog(void)
+{
+    sceMsgDialogClose();
+    OrbisCommonDialogStatus status;
+    do
+    {
+        status = sceMsgDialogUpdateStatus();
+        if (status != ORBIS_COMMON_DIALOG_STATUS_FINISHED && (int)status >= 0)
+            usleep(10000);
+        else
+            break;
+    } while (status != ORBIS_COMMON_DIALOG_STATUS_FINISHED);
+    sceMsgDialogTerminate();
+}
+
+static bool downloadAppUpdatePkg(const char *url, char *errorText, size_t errorTextSize)
+{
+    int netPoolId = -1;
+    int sslContextId = -1;
+    int httpContextId = -1;
+    int templateId = -1;
+    int connectionId = -1;
+    int requestId = -1;
+    int outputFd = -1;
+    int statusCode = 0;
+    int contentLengthType = 0;
+    size_t contentLength = 0;
+    uint64_t totalRead = 0;
+    int lastProgressPercent = 10;
+    bool ok = false;
+    bool gotFinalResponse = false;
+    typedef int32_t (*HttpSetResponseHeaderMaxSizeFn)(int32_t, uint32_t);
+    HttpSetResponseHeaderMaxSizeFn setResponseHeaderMaxSize =
+        reinterpret_cast<HttpSetResponseHeaderMaxSizeFn>(&sceHttpSetResponseHeaderMaxSize);
+    char currentUrl[2048];
+    char buffer[16384];
+    unlink(APP_UPDATE_TEMP_PATH);
+    snprintf(currentUrl, sizeof(currentUrl), "%s", url);
+
+    updateAppUpdateProgress("Initializing network...", 2);
+    if (mkdir("/data/pkg", 0777) != 0 && errno != EEXIST)
+    {
+        snprintf(errorText, errorTextSize, "could not create /data/pkg (errno %d)", errno);
+        goto cleanup;
+    }
+    if (sceSysmoduleLoadModuleInternal(ORBIS_SYSMODULE_INTERNAL_NET) < 0 ||
+        sceSysmoduleLoadModuleInternal(ORBIS_SYSMODULE_INTERNAL_HTTP) < 0 ||
+        sceSysmoduleLoadModuleInternal(ORBIS_SYSMODULE_INTERNAL_SSL) < 0)
+    {
+        snprintf(errorText, errorTextSize, "network modules could not be loaded");
+        goto cleanup;
+    }
+    sceNetInit();
+    netPoolId = sceNetPoolCreate("SponsorBlockPkgUpdateNet", 16 * 1024, 0);
+    if (netPoolId < 0)
+    {
+        snprintf(errorText, errorTextSize, "network pool failed (%d)", netPoolId);
+        goto cleanup;
+    }
+    sslContextId = sceSslInit(512 * 1024);
+    if (sslContextId < 0)
+    {
+        snprintf(errorText, errorTextSize, "SSL init failed (%d)", sslContextId);
+        goto cleanup;
+    }
+    httpContextId = sceHttpInit(netPoolId, sslContextId, 512 * 1024);
+    if (httpContextId < 0)
+    {
+        snprintf(errorText, errorTextSize, "HTTP init failed (%d)", httpContextId);
+        goto cleanup;
+    }
+    templateId = sceHttpCreateTemplate(httpContextId, "SponsorBlockConfig-Updater/1.0",
+                                       ORBIS_HTTP_VERSION_1_1, 1);
+    if (templateId < 0 || sceHttpsSetSslCallback(templateId, verifyGitHubCertificate, NULL) < 0)
+    {
+        snprintf(errorText, errorTextSize, "HTTP template or certificate setup failed");
+        goto cleanup;
+    }
+    if (setResponseHeaderMaxSize(templateId, 64 * 1024) < 0)
+    {
+        snprintf(errorText, errorTextSize, "HTTP response header limit setup failed");
+        goto cleanup;
+    }
+
+    for (int redirectCount = 0; redirectCount <= 5; ++redirectCount)
+    {
+        connectionId = sceHttpCreateConnectionWithURL(templateId, currentUrl, 1);
+        if (connectionId < 0)
+        {
+            snprintf(errorText, errorTextSize, "HTTP connection failed (%d)", connectionId);
+            goto cleanup;
+        }
+        requestId = sceHttpCreateRequestWithURL(connectionId, ORBIS_METHOD_GET, currentUrl, 0);
+        if (requestId < 0)
+        {
+            snprintf(errorText, errorTextSize, "HTTP request failed (%d)", requestId);
+            goto cleanup;
+        }
+        if (sceHttpSendRequest(requestId, NULL, 0) < 0)
+        {
+            int httpError = 0;
+            sceHttpGetLastErrno(requestId, &httpError);
+            snprintf(errorText, errorTextSize, "PKG download request failed (%d)", httpError);
+            goto cleanup;
+        }
+        if (sceHttpGetStatusCode(requestId, &statusCode) < 0)
+        {
+            snprintf(errorText, errorTextSize, "could not read PKG download status");
+            goto cleanup;
+        }
+        if (statusCode == 200)
+        {
+            gotFinalResponse = true;
+            break;
+        }
+        if (statusCode == 301 || statusCode == 302 || statusCode == 303 ||
+            statusCode == 307 || statusCode == 308)
+        {
+            char redirectUrl[2048];
+            if (redirectCount == 5 || !extractRedirectLocation(requestId, redirectUrl, sizeof(redirectUrl)))
+            {
+                snprintf(errorText, errorTextSize, "unsafe or excessive PKG download redirects");
+                goto cleanup;
+            }
+            sceHttpDeleteRequest(requestId);
+            requestId = -1;
+            sceHttpDeleteConnection(connectionId);
+            connectionId = -1;
+            snprintf(currentUrl, sizeof(currentUrl), "%s", redirectUrl);
+            continue;
+        }
+        snprintf(errorText, errorTextSize, "GitHub returned HTTP %d for the PKG", statusCode);
+        goto cleanup;
+    }
+    if (!gotFinalResponse)
+    {
+        snprintf(errorText, errorTextSize, "PKG download redirect limit exceeded");
+        goto cleanup;
+    }
+
+    if (sceHttpGetResponseContentLength(requestId, &contentLengthType, &contentLength) == 0 &&
+        contentLength > 0 && contentLength > 512ULL * 1024ULL * 1024ULL)
+    {
+        snprintf(errorText, errorTextSize, "PKG file is larger than the 512 MB safety limit");
+        goto cleanup;
+    }
+    updateAppUpdateProgress("Preparing update file...", 10);
+    outputFd = open(APP_UPDATE_TEMP_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (outputFd < 0)
+    {
+        snprintf(errorText, errorTextSize, "could not create PKG download (errno %d)", errno);
+        goto cleanup;
+    }
+    updateAppUpdateProgress("Downloading SponsorBlockConfig update...", 10);
+    for (;;)
+    {
+        int bytesRead = sceHttpReadData(requestId, buffer, sizeof(buffer));
+        if (bytesRead == 0) break;
+        if (bytesRead < 0)
+        {
+            snprintf(errorText, errorTextSize, "PKG download read failed (%d)", bytesRead);
+            goto cleanup;
+        }
+        if (totalRead + (uint64_t)bytesRead > 512ULL * 1024ULL * 1024ULL)
+        {
+            snprintf(errorText, errorTextSize, "PKG download exceeded the 512 MB safety limit");
+            goto cleanup;
+        }
+        if (!writeAll(outputFd, buffer, (size_t)bytesRead))
+        {
+            snprintf(errorText, errorTextSize, "could not write PKG download (errno %d)", errno);
+            goto cleanup;
+        }
+        totalRead += (uint64_t)bytesRead;
+        if (contentLength > 0)
+        {
+            int percent = 10 + (int)((totalRead * 85ULL) / contentLength);
+            char progressMessage[160];
+            if (percent > 95) percent = 95;
+            snprintf(progressMessage, sizeof(progressMessage),
+                     "Downloading... %llu / %llu MB",
+                     (unsigned long long)(totalRead / (1024ULL * 1024ULL)),
+                     (unsigned long long)(contentLength / (1024ULL * 1024ULL)));
+            if (percent != lastProgressPercent)
+            {
+                updateAppUpdateProgress(progressMessage, percent);
+                lastProgressPercent = percent;
+            }
+        }
+        else
+        {
+            static const uint64_t PROGRESS_STEP_BYTES = 1024ULL * 1024ULL;
+            if (totalRead / PROGRESS_STEP_BYTES > (totalRead - (uint64_t)bytesRead) / PROGRESS_STEP_BYTES)
+            {
+                char progressMessage[128];
+                snprintf(progressMessage, sizeof(progressMessage),
+                         "Downloading... %llu MB",
+                         (unsigned long long)(totalRead / PROGRESS_STEP_BYTES));
+                updateAppUpdateProgress(progressMessage, 50);
+            }
+        }
+    }
+    if (totalRead < 4096 || (contentLength > 0 && totalRead != contentLength))
+    {
+        snprintf(errorText, errorTextSize, "PKG download size check failed (%lu bytes)", (unsigned long)totalRead);
+        goto cleanup;
+    }
+    updateAppUpdateProgress("Verifying downloaded PKG...", 96);
+    if (fsync(outputFd) != 0)
+    {
+        snprintf(errorText, errorTextSize, "could not flush PKG download (errno %d)", errno);
+        goto cleanup;
+    }
+    if (close(outputFd) != 0)
+    {
+        outputFd = -1;
+        snprintf(errorText, errorTextSize, "could not close PKG download (errno %d)", errno);
+        goto cleanup;
+    }
+    outputFd = -1;
+
+    {
+        int verifyFd = open(APP_UPDATE_TEMP_PATH, O_RDONLY);
+        unsigned char magic[4];
+        ssize_t magicRead = verifyFd >= 0 ? read(verifyFd, magic, sizeof(magic)) : -1;
+        if (verifyFd >= 0) close(verifyFd);
+        if (magicRead != 4 || magic[0] != 0x7F || magic[1] != 'C' ||
+            magic[2] != 'N' || magic[3] != 'T')
+        {
+            snprintf(errorText, errorTextSize, "downloaded file does not have a valid PS4 PKG header");
+            goto cleanup;
+        }
+    }
+    updateAppUpdateProgress("Finalizing update...", 99);
+    if (rename(APP_UPDATE_TEMP_PATH, APP_UPDATE_PKG_PATH) != 0)
+    {
+        snprintf(errorText, errorTextSize, "could not finalize PKG download (errno %d)", errno);
+        goto cleanup;
+    }
+    ok = true;
+    updateAppUpdateProgress("Update downloaded successfully!", 100);
+    errorText[0] = '\0';
+
+cleanup:
+    if (outputFd >= 0) close(outputFd);
+    if (requestId >= 0) sceHttpDeleteRequest(requestId);
+    if (connectionId >= 0) sceHttpDeleteConnection(connectionId);
+    if (templateId >= 0) sceHttpDeleteTemplate(templateId);
+    if (httpContextId >= 0) sceHttpTerm(httpContextId);
+    if (sslContextId >= 0) sceSslTerm();
+    if (netPoolId >= 0) sceNetPoolDestroy(netPoolId);
+    if (!ok) unlink(APP_UPDATE_TEMP_PATH);
+    return ok;
+}
+
+static bool checkForAppUpdate(std::string &latestVersion, std::string &pkgUrl)
+{
+    std::string response;
+    char errorText[160];
+    if (!httpGetToString(LATEST_APP_RELEASE_API_URL, response, errorText, sizeof(errorText)))
+        return false;
+    unsigned int parsedParts[3];
+    if (!jsonGetString(response, "tag_name", latestVersion) ||
+        !parseReleaseVersion(latestVersion, parsedParts))
+        return false;
+    if (!isVersionNewer(latestVersion))
+    {
+        // The installed app is already up to date.
+        // remove update PKG so it does not remain in /data/pkg/.
+        unlink(APP_UPDATE_PKG_PATH);
+        return false;
+    }
+    return extractPkgAsset(response, pkgUrl);
+}
+
+static int askDownloadAppUpdate(const char *latestVersion, char *errorText, size_t errorTextSize)
+{
+    if (!ensureDialogServices(errorText, errorTextSize)) return -1;
+    int rc = sceMsgDialogInitialize();
+    if (rc < 0)
+    {
+        snprintf(errorText, errorTextSize, "Message dialog initialization failed (%d)", rc);
+        return -1;
+    }
+
+    OrbisMsgDialogParam param;
+    OrbisMsgDialogUserMessageParam userMsgParam;
+    OrbisMsgDialogResult result;
+    memset(&param, 0, sizeof(param));
+    memset(&userMsgParam, 0, sizeof(userMsgParam));
+    memset(&result, 0, sizeof(result));
+    param.baseParam.size = (uint32_t)sizeof(OrbisCommonDialogBaseParam);
+    param.baseParam.magic = (uint32_t)(ORBIS_COMMON_DIALOG_MAGIC_NUMBER + (uint64_t)&param.baseParam);
+    param.size = sizeof(OrbisMsgDialogParam);
+    param.mode = ORBIS_MSG_DIALOG_MODE_USER_MSG;
+
+    char prompt[256];
+    snprintf(prompt, sizeof(prompt),
+             "A new version is available: %s You are currently using v%s Would you like to download the update now?",
+             latestVersion, APP_RELEASE_VERSION);
+    userMsgParam.msg = prompt;
+    userMsgParam.buttonType = ORBIS_MSG_DIALOG_BUTTON_TYPE_YESNO_FOCUS_NO;
+    param.userMsgParam = &userMsgParam;
+
+    rc = sceMsgDialogOpen(&param);
+    if (rc < 0)
+    {
+        sceMsgDialogTerminate();
+        snprintf(errorText, errorTextSize, "Could not open update dialog (%d)", rc);
+        return -1;
+    }
+    OrbisCommonDialogStatus dialogStatus;
+    do
+    {
+        dialogStatus = sceMsgDialogUpdateStatus();
+        if ((int)dialogStatus < 0)
+        {
+            sceMsgDialogClose();
+            sceMsgDialogTerminate();
+            snprintf(errorText, errorTextSize, "Update dialog failed (%d)", (int)dialogStatus);
+            return -1;
+        }
+        if (dialogStatus != ORBIS_COMMON_DIALOG_STATUS_FINISHED) usleep(10000);
+    } while (dialogStatus != ORBIS_COMMON_DIALOG_STATUS_FINISHED);
+
+    sceMsgDialogClose();
+    rc = sceMsgDialogGetResult(&result);
+    sceMsgDialogTerminate();
+    if (rc < 0)
+    {
+        snprintf(errorText, errorTextSize, "Could not read update dialog result (%d)", rc);
+        return -1;
+    }
+    errorText[0] = '\0';
+    return result.buttonId == ORBIS_MSG_DIALOG_BUTTON_ID_YES ? 1 : 0;
+}
+
+static int showAppUpdateDownloadedDialog(char *errorText, size_t errorTextSize)
+{
+    int rc = sceMsgDialogInitialize();
+    if (rc < 0)
+    {
+        snprintf(errorText, errorTextSize, "Message dialog initialization failed (%d)", rc);
+        return -1;
+    }
+    OrbisMsgDialogParam param;
+    OrbisMsgDialogUserMessageParam userMsgParam;
+    OrbisMsgDialogResult result;
+    memset(&param, 0, sizeof(param));
+    memset(&userMsgParam, 0, sizeof(userMsgParam));
+    memset(&result, 0, sizeof(result));
+    param.baseParam.size = (uint32_t)sizeof(OrbisCommonDialogBaseParam);
+    param.baseParam.magic = (uint32_t)(ORBIS_COMMON_DIALOG_MAGIC_NUMBER + (uint64_t)&param.baseParam);
+    param.size = sizeof(OrbisMsgDialogParam);
+    param.mode = ORBIS_MSG_DIALOG_MODE_USER_MSG;
+    userMsgParam.msg = "Update downloaded successfully!\n\nTo install the update:\n1. Open GoldHEN > Debug Settings.\n2. Under Package Installer, disable Enable Background Installation.\n3. Open Package Installer and install SponsorBlockConfig-update.pkg.\n4. Confirm the update/reinstall if prompted.\n\nAfter installation, you can enable Background Installation again.";
+    userMsgParam.buttonType = ORBIS_MSG_DIALOG_BUTTON_TYPE_OK;
+    param.userMsgParam = &userMsgParam;
+    rc = sceMsgDialogOpen(&param);
+    if (rc < 0)
+    {
+        sceMsgDialogTerminate();
+        snprintf(errorText, errorTextSize, "Could not open download-complete dialog (%d)", rc);
+        return -1;
+    }
+    OrbisCommonDialogStatus dialogStatus;
+    do
+    {
+        dialogStatus = sceMsgDialogUpdateStatus();
+        if ((int)dialogStatus < 0)
+        {
+            sceMsgDialogClose();
+            sceMsgDialogTerminate();
+            snprintf(errorText, errorTextSize, "Download-complete dialog failed (%d)", (int)dialogStatus);
+            return -1;
+        }
+        if (dialogStatus != ORBIS_COMMON_DIALOG_STATUS_FINISHED) usleep(10000);
+    } while (dialogStatus != ORBIS_COMMON_DIALOG_STATUS_FINISHED);
+    sceMsgDialogClose();
+    rc = sceMsgDialogGetResult(&result);
+    sceMsgDialogTerminate();
+    if (rc < 0)
+    {
+        snprintf(errorText, errorTextSize, "Could not read download-complete dialog result (%d)", rc);
+        return -1;
+    }
+    errorText[0] = '\0';
+    return 0;
+}
+
+static int showAppUpdateFailedDialog(const char *reason, char *errorText, size_t errorTextSize)
+{
+    int rc = sceMsgDialogInitialize();
+    if (rc < 0)
+    {
+        snprintf(errorText, errorTextSize, "Message dialog initialization failed (%d)", rc);
+        return -1;
+    }
+    OrbisMsgDialogParam param;
+    OrbisMsgDialogUserMessageParam userMsgParam;
+    OrbisMsgDialogResult result;
+    memset(&param, 0, sizeof(param));
+    memset(&userMsgParam, 0, sizeof(userMsgParam));
+    memset(&result, 0, sizeof(result));
+    param.baseParam.size = (uint32_t)sizeof(OrbisCommonDialogBaseParam);
+    param.baseParam.magic = (uint32_t)(ORBIS_COMMON_DIALOG_MAGIC_NUMBER + (uint64_t)&param.baseParam);
+    param.size = sizeof(OrbisMsgDialogParam);
+    param.mode = ORBIS_MSG_DIALOG_MODE_USER_MSG;
+    char message[256];
+    snprintf(message, sizeof(message), "Could not download the SponsorBlockConfig update: %.170s", reason);
+    userMsgParam.msg = message;
+    userMsgParam.buttonType = ORBIS_MSG_DIALOG_BUTTON_TYPE_OK;
+    param.userMsgParam = &userMsgParam;
+    rc = sceMsgDialogOpen(&param);
+    if (rc < 0)
+    {
+        sceMsgDialogTerminate();
+        snprintf(errorText, errorTextSize, "Could not open update-error dialog (%d)", rc);
+        return -1;
+    }
+    OrbisCommonDialogStatus dialogStatus;
+    do
+    {
+        dialogStatus = sceMsgDialogUpdateStatus();
+        if ((int)dialogStatus < 0)
+        {
+            sceMsgDialogClose();
+            sceMsgDialogTerminate();
+            snprintf(errorText, errorTextSize, "Update-error dialog failed (%d)", (int)dialogStatus);
+            return -1;
+        }
+        if (dialogStatus != ORBIS_COMMON_DIALOG_STATUS_FINISHED) usleep(10000);
+    } while (dialogStatus != ORBIS_COMMON_DIALOG_STATUS_FINISHED);
+    sceMsgDialogClose();
+    rc = sceMsgDialogGetResult(&result);
+    sceMsgDialogTerminate();
+    if (rc < 0)
+    {
+        snprintf(errorText, errorTextSize, "Could not read update-error dialog result (%d)", rc);
+        return -1;
+    }
+    errorText[0] = '\0';
+    return 0;
+}
+
 static bool installPrx(char *errorText, size_t errorTextSize, bool *iniEntryAdded, bool *usedBundledFallback)
 {
     const char *bundledSourcePath = "/app0/assets/misc/yt_adblock.prx";
@@ -1453,6 +2276,40 @@ int main(void)
             if (selected[i]) ++initiallySelected;
         if (initiallySelected > 0)
             snprintf(status, sizeof(status), "Loaded %d saved categories. Adjust settings, then save when ready.", initiallySelected);
+    }
+
+    // Check stable GitHub releases once at startup. Network failures never block the app.
+    std::string latestAppVersion;
+    std::string latestAppPkgUrl;
+    if (checkForAppUpdate(latestAppVersion, latestAppPkgUrl))
+    {
+        char updateDialogError[160] = "";
+        int updateChoice = askDownloadAppUpdate(latestAppVersion.c_str(),
+                                                updateDialogError, sizeof(updateDialogError));
+        if (updateChoice == 1)
+        {
+            char downloadError[192] = "";
+            if (!openAppUpdateProgressDialog(downloadError, sizeof(downloadError)))
+            {
+                showAppUpdateFailedDialog(downloadError, updateDialogError, sizeof(updateDialogError));
+            }
+            else
+            {
+                bool downloadSucceeded =
+                    downloadAppUpdatePkg(latestAppPkgUrl.c_str(), downloadError, sizeof(downloadError));
+                if (downloadSucceeded)
+                    updateAppUpdateProgress("Update downloaded successfully!", 100);
+                else
+                    updateAppUpdateProgress("Download failed.", 100);
+                usleep(500000);
+                closeAppUpdateProgressDialog();
+
+                if (downloadSucceeded)
+                    showAppUpdateDownloadedDialog(updateDialogError, sizeof(updateDialogError));
+                else
+                    showAppUpdateFailedDialog(downloadError, updateDialogError, sizeof(updateDialogError));
+            }
+        }
     }
 
     for (;;)
@@ -1676,7 +2533,9 @@ int main(void)
         drawControllerIcon(scene, "cross", 1325, 508);
         drawText(scene, "Save and install", menuFont, 1370, 530, black, muted);
         drawText(scene, "OPTIONS: Uninstall All", smallFont, 1682, 1035, black, muted);
-        drawText(scene, "Version: 01.00", smallFont, 1765, 1065, black, muted);
+        char versionText[64];
+        snprintf(versionText, sizeof(versionText), "Version: %s", APP_RELEASE_VERSION);
+        drawText(scene, versionText, smallFont, 1765, 1065, black, muted);
         if (status[0] != '\0')
             drawText(scene, status, menuFont, 150, 1000, black, statusIsError ? red : green);
 

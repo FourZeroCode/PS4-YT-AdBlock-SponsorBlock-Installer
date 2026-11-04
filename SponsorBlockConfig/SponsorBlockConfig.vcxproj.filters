@@ -29,6 +29,7 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="controller.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="version.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="..\_common\log.h">
       <Filter>Header Files</Filter>
     </ClInclude>
