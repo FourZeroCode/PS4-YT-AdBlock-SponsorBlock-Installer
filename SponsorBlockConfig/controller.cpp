@@ -45,10 +45,35 @@ bool Controller::Init(int controllerUserID)
 
 void Controller::Poll()
 {
-    OrbisPadData data;
+    OrbisPadData data = {};
     previousButtons = currentButtons;
+
+    // Keep the same polling function that the original working controller used.
+    // OpenOrbis OrbisPadData includes the analogue axes in leftStick.
     if (scePadReadState(pad, &data) == 0)
+    {
         currentButtons = data.buttons;
+
+        // DS4 stick axes are unsigned bytes centred around 128.
+        // DELTA 123 corresponds to near-full deflection.
+        // Activate before the stick reaches its physical edge.
+        // Values are 0-255, with approximately 128 at rest.
+        // Adjust these two values to tune sensitivity:
+        // lower STICK_LOW / higher STICK_HIGH = later activation.
+        // higher STICK_LOW / lower STICK_HIGH = earlier activation.
+        const int STICK_LOW = 80;
+        const int STICK_HIGH = 176;
+
+        if (data.leftStick.y < STICK_LOW)
+            currentButtons |= ORBIS_PAD_BUTTON_UP;
+        else if (data.leftStick.y > STICK_HIGH)
+            currentButtons |= ORBIS_PAD_BUTTON_DOWN;
+
+        if (data.leftStick.x < STICK_LOW)
+            currentButtons |= ORBIS_PAD_BUTTON_LEFT;
+        else if (data.leftStick.x > STICK_HIGH)
+            currentButtons |= ORBIS_PAD_BUTTON_RIGHT;
+    }
 }
 
 bool Controller::Pressed(int buttonMask) const

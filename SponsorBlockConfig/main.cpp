@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <dirent.h>
 #include <unistd.h>
 #include <sstream>
 #include <string>
@@ -36,8 +37,8 @@ static char downloadFailureReason[128] = "not attempted";
 #define CONFIG_PATH "/data/youtube/config.json"
 
 #define LATEST_APP_RELEASE_API_URL "https://api.github.com/repos/FourZeroCode/PS4-YT-AdBlock-SponsorBlock-Installer/releases/latest"
-#define APP_UPDATE_TEMP_PATH "/data/pkg/SponsorBlockConfig-update.pkg.download"
-#define APP_UPDATE_PKG_PATH "/data/pkg/SponsorBlockConfig-update.pkg"
+#define APP_UPDATE_TEMP_PATH "/data/pkg/AdlessTube-update.pkg.download"
+#define APP_UPDATE_PKG_PATH "/data/pkg/AdlessTube-update.pkg"
 
 std::stringstream debugLogStream;
 int frameID = 0;
@@ -55,7 +56,7 @@ static Category categories[CATEGORY_COUNT] = {
     { "intro", "Intro / intermission" },
     { "outro", "Endcards / credits" },
     { "preview", "Preview / recap" },
-    { "music_offtopic", "Non-music section in music video" },
+    { "music_offtopic", "Non-music sections" },
     { "filler", "Filler / tangents" },
     { "hook", "Hook / greeting" },
     { "poi_highlight", "Point of interest / highlight" },
@@ -65,9 +66,12 @@ static Category categories[CATEGORY_COUNT] = {
 
 static bool selected[CATEGORY_COUNT] = { false };
 
-// Default to confirm for existing configs that do not yet contain skipMode.
-static bool skipModeAuto = false;
-static const int MENU_ITEM_COUNT = CATEGORY_COUNT + 1;
+// Skip modes: 0 = ask for confirmation, 1 = auto skip, 2 = auto without notifications.
+static int skipMode = 0;
+static bool adBlockEnabled = true;
+static bool sponsorBlockEnabled = true;
+// Order: skip mode, plugin toggles, then the 12 categories.
+static const int MENU_ITEM_COUNT = CATEGORY_COUNT + 3;
 
 static void drawText(Scene2D *scene, const char *text, FT_Face font,
                      int x, int y, Color background, Color foreground)
@@ -75,6 +79,52 @@ static void drawText(Scene2D *scene, const char *text, FT_Face font,
     char mutableText[256];
     snprintf(mutableText, sizeof(mutableText), "%s", text);
     scene->DrawText(mutableText, font, x, y, background, foreground);
+}
+
+// Right-align the value so changing digits don't move it.
+static int getTextWidth(const char *text, FT_Face font)
+{
+    int textWidth = 0;
+    FT_UInt previousGlyph = 0;
+
+    for (const unsigned char *p = (const unsigned char *)text; *p; ++p)
+    {
+        FT_UInt glyph = FT_Get_Char_Index(font, *p);
+        if (FT_HAS_KERNING(font) && previousGlyph && glyph)
+        {
+            FT_Vector kerning;
+            if (FT_Get_Kerning(font, previousGlyph, glyph, FT_KERNING_DEFAULT, &kerning) == 0)
+                textWidth += (int)(kerning.x >> 6);
+        }
+        if (FT_Load_Glyph(font, glyph, FT_LOAD_DEFAULT) == 0)
+            textWidth += (int)(font->glyph->advance.x >> 6);
+        previousGlyph = glyph;
+    }
+
+    return textWidth;
+}
+
+static void drawTextRightAligned(Scene2D *scene, const char *text, FT_Face font,
+                                 int rightEdge, int y, Color background, Color foreground)
+{
+    int textWidth = 0;
+    FT_UInt previousGlyph = 0;
+
+    for (const unsigned char *p = (const unsigned char *)text; *p; ++p)
+    {
+        FT_UInt glyph = FT_Get_Char_Index(font, *p);
+        if (FT_HAS_KERNING(font) && previousGlyph && glyph)
+        {
+            FT_Vector kerning;
+            if (FT_Get_Kerning(font, previousGlyph, glyph, FT_KERNING_DEFAULT, &kerning) == 0)
+                textWidth += (int)(kerning.x >> 6);
+        }
+        if (FT_Load_Glyph(font, glyph, FT_LOAD_DEFAULT) == 0)
+            textWidth += (int)(font->glyph->advance.x >> 6);
+        previousGlyph = glyph;
+    }
+
+    drawText(scene, text, font, rightEdge - textWidth, y, background, foreground);
 }
 
 // Draw the button icons.
@@ -113,7 +163,7 @@ static void drawControllerIcon(Scene2D *scene, const char *icon, int x, int y)
     Color triangleGreen = { 0, 190, 110 };
     Color squarePink = { 245, 80, 150 };
     Color crossBlue = { 75, 155, 255 };
-    Color arrowWhite = { 225, 232, 240 };
+    Color circleRed = { 235, 65, 65 };
 
     if (strcmp(icon, "triangle") == 0)
     {
@@ -137,16 +187,84 @@ static void drawControllerIcon(Scene2D *scene, const char *icon, int x, int y)
             drawLine(scene, x + 24 + offset, y + 4, x + 4 + offset, y + 24, crossBlue);
         }
     }
-    else if (strcmp(icon, "arrows") == 0)
+    else if (strcmp(icon, "circle") == 0)
     {
-        // D-pad arrows.
-        drawLine(scene, x + 7, y + 11, x + 7, y + 1, arrowWhite);
-        drawLine(scene, x + 1, y + 7, x + 7, y + 1, arrowWhite);
-        drawLine(scene, x + 13, y + 7, x + 7, y + 1, arrowWhite);
-        drawLine(scene, x + 20, y + 14, x + 20, y + 25, arrowWhite);
-        drawLine(scene, x + 14, y + 19, x + 20, y + 25, arrowWhite);
-        drawLine(scene, x + 26, y + 19, x + 20, y + 25, arrowWhite);
+        // Circle button.
+        const int centerX = x + 14;
+        const int centerY = y + 14;
+        int circleX = 12;
+        int circleY = 0;
+        int decision = 1 - circleX;
+
+        while (circleX >= circleY)
+        {
+            scene->DrawPixel(centerX + circleX, centerY + circleY, circleRed);
+            scene->DrawPixel(centerX + circleY, centerY + circleX, circleRed);
+            scene->DrawPixel(centerX - circleY, centerY + circleX, circleRed);
+            scene->DrawPixel(centerX - circleX, centerY + circleY, circleRed);
+            scene->DrawPixel(centerX - circleX, centerY - circleY, circleRed);
+            scene->DrawPixel(centerX - circleY, centerY - circleX, circleRed);
+            scene->DrawPixel(centerX + circleY, centerY - circleX, circleRed);
+            scene->DrawPixel(centerX + circleX, centerY - circleY, circleRed);
+
+            ++circleY;
+            if (decision < 0)
+                decision += 2 * circleY + 1;
+            else
+            {
+                --circleX;
+                decision += 2 * (circleY - circleX) + 1;
+            }
+        }
     }
+
+}
+
+// Show a native PS4 notification.
+static void sendSystemNotification(const char *message)
+{
+    OrbisNotificationRequest notification;
+    memset(&notification, 0, sizeof(notification));
+
+    notification.type = OrbisNotificationRequestType::NotificationRequest;
+    notification.unk3 = 0;
+    notification.useIconImageUri = true;
+    notification.targetId = -1;
+
+    snprintf(notification.iconUri, sizeof(notification.iconUri),
+             "file://user/appmeta/SBCK00001/icon0.png");
+
+    if (message != NULL)
+        strncpy(notification.message, message, sizeof(notification.message) - 1);
+
+    sceKernelSendNotificationRequest(0, &notification, sizeof(notification), 0);
+}
+
+static bool jsonGetBoolValue(const std::string &json, const char *key, bool defaultValue)
+{
+    std::string quotedKey = "\"";
+    quotedKey += key;
+    quotedKey += "\"";
+
+    size_t position = json.find(quotedKey);
+    if (position == std::string::npos)
+        return defaultValue;
+
+    position = json.find(':', position + quotedKey.size());
+    if (position == std::string::npos)
+        return defaultValue;
+    ++position;
+
+    while (position < json.size() &&
+           (json[position] == ' ' || json[position] == '\n' ||
+            json[position] == '\r' || json[position] == '\t'))
+        ++position;
+
+    if (json.compare(position, 4, "true") == 0)
+        return true;
+    if (json.compare(position, 5, "false") == 0)
+        return false;
+    return defaultValue;
 }
 
 static bool writeAll(int fd, const char *data, size_t length)
@@ -171,13 +289,15 @@ static bool writeAll(int fd, const char *data, size_t length)
 
 static bool loadConfig(char *errorText, size_t errorTextSize)
 {
-	// If config.json is missing, leave all categories unselected and default to skipMode "confirm".
+    // If config.json is missing, leave all categories unselected and default to skipMode "confirm".
     int fd = open(CONFIG_PATH, O_RDONLY);
     if (fd < 0)
     {
         if (errno == ENOENT)
         {
-            skipModeAuto = false;
+            skipMode = 0;
+            adBlockEnabled = true;
+            sponsorBlockEnabled = true;
             errorText[0] = '\0';
             return true;
         }
@@ -202,7 +322,7 @@ static bool loadConfig(char *errorText, size_t errorTextSize)
             return false;
         }
         contents.append(buffer, (size_t)bytesRead);
-        // The config should never be this big.
+        // Guard against an oversized config file.
         if (contents.size() > 65536)
         {
             close(fd);
@@ -260,7 +380,7 @@ static bool loadConfig(char *errorText, size_t errorTextSize)
 
     // Optional setting for compatibility with configs created before skipMode existed.
     // Missing or unrecognized values safely default to "confirm".
-    skipModeAuto = false;
+    skipMode = 0;
     size_t skipModeKey = contents.find("\"skipMode\"");
     if (skipModeKey != std::string::npos)
     {
@@ -272,9 +392,18 @@ static bool loadConfig(char *errorText, size_t errorTextSize)
         if (valueStart != std::string::npos && valueEnd != std::string::npos)
         {
             std::string mode = contents.substr(valueStart + 1, valueEnd - valueStart - 1);
-            skipModeAuto = (mode == "auto");
+            if (mode == "auto")
+                skipMode = 1;
+            else if (mode == "silent")
+                skipMode = 2;
+            else
+                skipMode = 0;
         }
     }
+
+    // Enable new settings when their keys are missing.
+    adBlockEnabled = jsonGetBoolValue(contents, "adBlockEnabled", true);
+    sponsorBlockEnabled = jsonGetBoolValue(contents, "sponsorBlockEnabled", true);
 
     errorText[0] = '\0';
     return true;
@@ -320,8 +449,12 @@ static bool saveConfig(char *errorText, size_t errorTextSize, int *savedCount)
     }
 
     n = snprintf(json + used, sizeof(json) - used,
-                 "  ],\n  \"skipMode\": \"%s\"\n}\n",
-                 skipModeAuto ? "auto" : "confirm");
+                 "  ],\n  \"skipMode\": \"%s\",\n"
+                 "  \"adBlockEnabled\": %s,\n"
+                 "  \"sponsorBlockEnabled\": %s\n}\n",
+                 skipMode == 1 ? "auto" : (skipMode == 2 ? "silent" : "confirm"),
+                 adBlockEnabled ? "true" : "false",
+                 sponsorBlockEnabled ? "true" : "false");
     if (n < 0 || (size_t)n >= sizeof(json) - used)
     {
         snprintf(errorText, errorTextSize, "JSON buffer too small");
@@ -406,7 +539,7 @@ static int askInstallPrx(char *errorText, size_t errorTextSize)
     memset(&userMsgParam, 0, sizeof(userMsgParam));
     memset(&result, 0, sizeof(result));
 
-	// Set up the OpenOrbis dialog.
+    // Set up the OpenOrbis dialog.
     param.baseParam.size = (uint32_t)sizeof(OrbisCommonDialogBaseParam);
     param.baseParam.magic = (uint32_t)(ORBIS_COMMON_DIALOG_MAGIC_NUMBER +
                                        (uint64_t)&param.baseParam);
@@ -414,11 +547,11 @@ static int askInstallPrx(char *errorText, size_t errorTextSize)
     param.mode = ORBIS_MSG_DIALOG_MODE_USER_MSG;
 
     struct stat existingPrxInfo;
-    bool existingPrx = stat("/data/GoldHEN/plugins/yt_adblock.prx", &existingPrxInfo) == 0 &&
+    bool existingPrx = stat("/data/GoldHEN/plugins/ps4_yt_adsponsorblock.prx", &existingPrxInfo) == 0 &&
                        S_ISREG(existingPrxInfo.st_mode);
     userMsgParam.msg = existingPrx
-        ? "PS4 YT AdBlock + SponsorBlock already exists. Do you want to update it?"
-        : "Install PS4 YT AdBlock + SponsorBlock?";
+        ? "AdlessTube already exists. Do you want to update it?"
+        : "Install AdlessTube?";
     userMsgParam.buttonType = ORBIS_MSG_DIALOG_BUTTON_TYPE_YESNO_FOCUS_NO;
     param.userMsgParam = &userMsgParam;
 
@@ -489,7 +622,7 @@ static int askUninstallConfirmation(char *errorText, size_t errorTextSize)
     param.mode = ORBIS_MSG_DIALOG_MODE_USER_MSG;
 
     userMsgParam.msg =
-        "Uninstall PS4 YT AdBlock + SponsorBlock? This will delete the PRX, SponsorBlock config, and this app's plugins.ini entry.";
+        "Uninstall AdlessTube? This will delete all related files and configurations.";
     userMsgParam.buttonType = ORBIS_MSG_DIALOG_BUTTON_TYPE_YESNO_FOCUS_NO;
     param.userMsgParam = &userMsgParam;
 
@@ -531,7 +664,7 @@ static int askUninstallConfirmation(char *errorText, size_t errorTextSize)
 }
 
 
-static int showSuccessDialog(bool wasUpdate, bool usedBundledFallback, char *errorText, size_t errorTextSize)
+static int showSuccessDialog(bool wasUpdate, bool usedBundledFallback, bool usedCachedFallback, char *errorText, size_t errorTextSize)
 {
     int rc = sceMsgDialogInitialize();
     if (rc < 0)
@@ -554,11 +687,14 @@ static int showSuccessDialog(bool wasUpdate, bool usedBundledFallback, char *err
     param.mode = ORBIS_MSG_DIALOG_MODE_USER_MSG;
     char successMessage[320];
     if (usedBundledFallback)
-        snprintf(successMessage, sizeof(successMessage), "%s using bundled PRX. GitHub download failed: %.120s",
-                 wasUpdate ? "Update completed" : "Installed", downloadFailureReason);
+        snprintf(successMessage, sizeof(successMessage), "GitHub check failed. %s using bundled PRX.",
+                 wasUpdate ? "Update successful" : "Install successful");
+    else if (usedCachedFallback)
+        snprintf(successMessage, sizeof(successMessage), "GitHub check failed. %s using cached PRX.",
+                 wasUpdate ? "Update successful" : "Install successful");
     else
-        snprintf(successMessage, sizeof(successMessage), "%s from the latest GitHub release.",
-                 wasUpdate ? "PS4 YT AdBlock + SponsorBlock updated" : "PS4 YT AdBlock + SponsorBlock installed");
+        snprintf(successMessage, sizeof(successMessage), "%s.",
+                 wasUpdate ? "Update successful" : "Install successful");
     userMsgParam.msg = successMessage;
     userMsgParam.buttonType = ORBIS_MSG_DIALOG_BUTTON_TYPE_OK;
     param.userMsgParam = &userMsgParam;
@@ -599,85 +735,30 @@ static int showSuccessDialog(bool wasUpdate, bool usedBundledFallback, char *err
     return result.buttonId == ORBIS_MSG_DIALOG_BUTTON_ID_INVALID ? 0 : 1;
 }
 
-static int showConfigSavedDialog(char *errorText, size_t errorTextSize)
-{
-    // Triangle might be pressed before the install dialog, so make sure
-    // the dialog services are ready.
-    int rc;
-    if (!ensureDialogServices(errorText, errorTextSize))
-        return -1;
-
-    rc = sceMsgDialogInitialize();
-    if (rc < 0)
-    {
-        snprintf(errorText, errorTextSize, "Message dialog initialization failed (%d)", rc);
-        return -1;
-    }
-
-    OrbisMsgDialogParam param;
-    OrbisMsgDialogUserMessageParam userMsgParam;
-    OrbisMsgDialogResult result;
-    memset(&param, 0, sizeof(param));
-    memset(&userMsgParam, 0, sizeof(userMsgParam));
-    memset(&result, 0, sizeof(result));
-
-    param.baseParam.size = (uint32_t)sizeof(OrbisCommonDialogBaseParam);
-    param.baseParam.magic = (uint32_t)(ORBIS_COMMON_DIALOG_MAGIC_NUMBER +
-                                       (uint64_t)&param.baseParam);
-    param.size = sizeof(OrbisMsgDialogParam);
-    param.mode = ORBIS_MSG_DIALOG_MODE_USER_MSG;
-    userMsgParam.msg = "Configuration saved successfully.";
-    userMsgParam.buttonType = ORBIS_MSG_DIALOG_BUTTON_TYPE_OK;
-    param.userMsgParam = &userMsgParam;
-
-    rc = sceMsgDialogOpen(&param);
-    if (rc < 0)
-    {
-        sceMsgDialogTerminate();
-        snprintf(errorText, errorTextSize, "Could not open save dialog (%d)", rc);
-        return -1;
-    }
-
-    OrbisCommonDialogStatus dialogStatus;
-    do
-    {
-        dialogStatus = sceMsgDialogUpdateStatus();
-        if ((int)dialogStatus < 0)
-        {
-            sceMsgDialogClose();
-            sceMsgDialogTerminate();
-            snprintf(errorText, errorTextSize, "Save dialog failed (%d)", (int)dialogStatus);
-            return -1;
-        }
-        if (dialogStatus != ORBIS_COMMON_DIALOG_STATUS_FINISHED)
-            usleep(10000);
-    } while (dialogStatus != ORBIS_COMMON_DIALOG_STATUS_FINISHED);
-
-    sceMsgDialogClose();
-    rc = sceMsgDialogGetResult(&result);
-    sceMsgDialogTerminate();
-    if (rc < 0)
-    {
-        snprintf(errorText, errorTextSize, "Could not read save dialog result (%d)", rc);
-        return -1;
-    }
-
-    errorText[0] = '\0';
-    return result.buttonId == ORBIS_MSG_DIALOG_BUTTON_ID_INVALID ? 0 : 1;
-}
-
 static bool ensurePluginsIniEntry(char *errorText, size_t errorTextSize, bool *wasAdded)
 {
     const char *iniPath = "/data/GoldHEN/plugins.ini";
+    const char *tempPath = "/data/GoldHEN/plugins.ini.adlesstube.tmp";
     const std::string sectionLine = "[CUSA01015]";
-    const std::string pluginLine = "/data/GoldHEN/plugins/yt_adblock.prx";
+    const std::string legacySectionLine = "[CUSA01015]\\";
+    const std::string pluginLine = "/data/GoldHEN/plugins/ps4_yt_adsponsorblock.prx";
     if (wasAdded)
         *wasAdded = false;
 
     std::string contents;
+    struct stat originalInfo;
+    bool fileExists = false;
     int readFd = open(iniPath, O_RDONLY);
     if (readFd >= 0)
     {
+        fileExists = true;
+        if (fstat(readFd, &originalInfo) != 0)
+        {
+            int savedErrno = errno;
+            close(readFd);
+            snprintf(errorText, errorTextSize, "plugins.ini stat failed (errno %d)", savedErrno);
+            return false;
+        }
         char buffer[4096];
         for (;;)
         {
@@ -706,59 +787,173 @@ static bool ensurePluginsIniEntry(char *errorText, size_t errorTextSize, bool *w
         return false;
     }
 
-    // If the two exact lines are already adjacent, do not modify the file.
-    std::string previousLine;
+    // First pass: determine whether the AdlessTube entry already exists
+    // in any CUSA01015 section, including repeated section headers.
+    bool pluginAlreadyPresent = false;
+    bool inTargetSection = false;
     size_t position = 0;
     while (position < contents.size())
     {
         size_t newline = contents.find('\n', position);
-        size_t lineEnd = (newline == std::string::npos) ? contents.size() : newline;
-        std::string currentLine = contents.substr(position, lineEnd - position);
-        if (!currentLine.empty() && currentLine[currentLine.size() - 1] == '\r')
-            currentLine.erase(currentLine.size() - 1);
-        if ((previousLine == sectionLine || previousLine == "[CUSA01015]\\") && currentLine == pluginLine)
+        size_t lineEnd = (newline == std::string::npos) ? contents.size() : newline + 1;
+        std::string line = contents.substr(position, lineEnd - position);
+        std::string compareLine = line;
+        if (!compareLine.empty() && compareLine[compareLine.size() - 1] == '\n')
+            compareLine.erase(compareLine.size() - 1);
+        if (!compareLine.empty() && compareLine[compareLine.size() - 1] == '\r')
+            compareLine.erase(compareLine.size() - 1);
+
+        if (!compareLine.empty() && compareLine[0] == '[')
         {
-            errorText[0] = '\0';
-            return true;
+            inTargetSection = (compareLine == sectionLine || compareLine == legacySectionLine);
         }
-        previousLine = currentLine;
-        if (newline == std::string::npos) break;
-        position = newline + 1;
+        else if (inTargetSection && compareLine == pluginLine)
+        {
+            pluginAlreadyPresent = true;
+        }
+        position = lineEnd;
     }
 
-	// Add entry at the end of plugins.ini.
-    int appendFd = open(iniPath, O_WRONLY | O_CREAT | O_APPEND, 0666);
-    if (appendFd < 0)
+    // Second pass: combine repeated CUSA01015 headers into one section,
+    // preserve all other lines, and add our PRX path only once.
+    std::string updated;
+    updated.reserve(contents.size() + pluginLine.size() + 32);
+    bool keptTargetHeader = false;
+    bool inKeptTargetSection = false;
+    bool pluginWritten = false;
+    bool changed = false;
+    position = 0;
+    while (position < contents.size())
     {
-        snprintf(errorText, errorTextSize, "plugins.ini append open failed (errno %d)", errno);
+        size_t newline = contents.find('\n', position);
+        size_t lineEnd = (newline == std::string::npos) ? contents.size() : newline + 1;
+        std::string line = contents.substr(position, lineEnd - position);
+        std::string compareLine = line;
+        if (!compareLine.empty() && compareLine[compareLine.size() - 1] == '\n')
+            compareLine.erase(compareLine.size() - 1);
+        if (!compareLine.empty() && compareLine[compareLine.size() - 1] == '\r')
+            compareLine.erase(compareLine.size() - 1);
+
+        if (!compareLine.empty() && compareLine[0] == '[')
+        {
+            bool isTargetHeader = (compareLine == sectionLine || compareLine == legacySectionLine);
+            if (isTargetHeader)
+            {
+                if (!keptTargetHeader || !inKeptTargetSection)
+                {
+                    // Keep a target header when another section appeared
+                    // in between; removing it would reassign its entries.
+                    updated.append(line);
+                    keptTargetHeader = true;
+                    inKeptTargetSection = true;
+                }
+                else
+                {
+                    // Collapse only adjacent repeated target headers.
+                    // Their entries remain in the same section.
+                    changed = true;
+                    inKeptTargetSection = true;
+                }
+            }
+            else
+            {
+                if (inKeptTargetSection && !pluginAlreadyPresent && !pluginWritten)
+                {
+                    if (!updated.empty() && updated[updated.size() - 1] != '\n')
+                        updated += "\n";
+                    updated += pluginLine + "\n";
+                    pluginWritten = true;
+                    changed = true;
+                }
+                updated.append(line);
+                inKeptTargetSection = false;
+            }
+        }
+        else if (inKeptTargetSection && compareLine == pluginLine)
+        {
+            if (!pluginWritten)
+            {
+                updated.append(line);
+                pluginWritten = true;
+            }
+            else
+            {
+                // Remove duplicate copies of only our own exact PRX line.
+                changed = true;
+            }
+        }
+        else
+        {
+            updated.append(line);
+        }
+        position = lineEnd;
+    }
+
+    if (keptTargetHeader)
+    {
+        if (!pluginAlreadyPresent && !pluginWritten)
+        {
+            if (!updated.empty() && updated[updated.size() - 1] != '\n')
+                updated += "\n";
+            updated += pluginLine + "\n";
+            changed = true;
+        }
+    }
+    else
+    {
+        if (!updated.empty() && updated[updated.size() - 1] != '\n')
+            updated += "\n";
+        updated += sectionLine + "\n" + pluginLine + "\n";
+        changed = true;
+    }
+
+    // No file changes are needed when the entry already exists.
+    if (!changed)
+    {
+        errorText[0] = '\0';
+        return true;
+    }
+
+    int tempFd = open(tempPath, O_WRONLY | O_CREAT | O_TRUNC,
+                      fileExists ? (originalInfo.st_mode & 0777) : 0666);
+    if (tempFd < 0)
+    {
+        snprintf(errorText, errorTextSize, "plugins.ini temp open failed (errno %d)", errno);
         return false;
     }
 
-    std::string addition;
-    if (!contents.empty() && contents[contents.size() - 1] != '\n')
-        addition += "\n";
-    addition += "[CUSA01015]\n";
-    addition += "/data/GoldHEN/plugins/yt_adblock.prx\n";
-
-    bool ok = writeAll(appendFd, addition.c_str(), addition.size());
+    bool ok = true;
+    if (fileExists && fchmod(tempFd, originalInfo.st_mode & 0777) != 0)
+        ok = false;
+    if (ok)
+        ok = writeAll(tempFd, updated.c_str(), updated.size());
     int savedErrno = errno;
-    if (ok && fsync(appendFd) != 0)
+    if (ok && fsync(tempFd) != 0)
     {
         ok = false;
         savedErrno = errno;
     }
-    if (close(appendFd) != 0 && ok)
+    if (close(tempFd) != 0 && ok)
     {
         ok = false;
         savedErrno = errno;
     }
     if (!ok)
     {
-        snprintf(errorText, errorTextSize, "plugins.ini append failed (errno %d)", savedErrno);
+        unlink(tempPath);
+        snprintf(errorText, errorTextSize, "plugins.ini rewrite failed (errno %d)", savedErrno);
         return false;
     }
 
-    // Verify the appended entry can be read back.
+    if (rename(tempPath, iniPath) != 0)
+    {
+        int renameErrno = errno;
+        unlink(tempPath);
+        snprintf(errorText, errorTextSize, "plugins.ini replace failed (errno %d)", renameErrno);
+        return false;
+    }
+
+    // Verify that the PRX path is present under a CUSA01015 section.
     int verifyFd = open(iniPath, O_RDONLY);
     if (verifyFd < 0)
     {
@@ -770,7 +965,8 @@ static bool ensurePluginsIniEntry(char *errorText, size_t errorTextSize, bool *w
     {
         char buffer[4096];
         ssize_t bytesRead = read(verifyFd, buffer, sizeof(buffer));
-        if (bytesRead == 0) break;
+        if (bytesRead == 0)
+            break;
         if (bytesRead < 0)
         {
             if (errno == EINTR) continue;
@@ -781,28 +977,49 @@ static bool ensurePluginsIniEntry(char *errorText, size_t errorTextSize, bool *w
         }
         verifyContents.append(buffer, (size_t)bytesRead);
     }
-    close(verifyFd);
+    if (close(verifyFd) != 0)
+    {
+        snprintf(errorText, errorTextSize, "plugins.ini verification close failed (errno %d)", errno);
+        return false;
+    }
 
-    if (verifyContents.find(sectionLine + "\n" + pluginLine) == std::string::npos &&
-        verifyContents.find(sectionLine + "\r\n" + pluginLine) == std::string::npos &&
-        verifyContents.find("[CUSA01015]\\\n" + pluginLine) == std::string::npos &&
-        verifyContents.find("[CUSA01015]\\\r\n" + pluginLine) == std::string::npos)
+    bool verifiedEntry = false;
+    bool verifyInTargetSection = false;
+    size_t verifyPosition = 0;
+    while (verifyPosition < verifyContents.size())
+    {
+        size_t newline = verifyContents.find('\n', verifyPosition);
+        size_t lineEnd = (newline == std::string::npos) ? verifyContents.size() : newline + 1;
+        std::string line = verifyContents.substr(verifyPosition, lineEnd - verifyPosition);
+        std::string compareLine = line;
+        if (!compareLine.empty() && compareLine[compareLine.size() - 1] == '\n')
+            compareLine.erase(compareLine.size() - 1);
+        if (!compareLine.empty() && compareLine[compareLine.size() - 1] == '\r')
+            compareLine.erase(compareLine.size() - 1);
+        if (!compareLine.empty() && compareLine[0] == '[')
+            verifyInTargetSection = (compareLine == sectionLine || compareLine == legacySectionLine);
+        else if (verifyInTargetSection && compareLine == pluginLine)
+            verifiedEntry = true;
+        verifyPosition = lineEnd;
+    }
+    if (!verifiedEntry)
     {
         snprintf(errorText, errorTextSize, "plugins.ini write could not be verified");
         return false;
     }
 
-    if (wasAdded) *wasAdded = true;
+    if (wasAdded)
+        *wasAdded = !pluginAlreadyPresent;
     errorText[0] = '\0';
     return true;
 }
 
-static bool removePluginsIniEntry(char *errorText, size_t errorTextSize)
+static bool removePluginsIniEntry(const char *pluginPath, char *errorText, size_t errorTextSize)
 {
     const char *iniPath = "/data/GoldHEN/plugins.ini";
     const char *tempPath = "/data/GoldHEN/plugins.ini.sponsorblock.tmp";
     const std::string targetSection = "[CUSA01015]";
-    const std::string targetPlugin = "/data/GoldHEN/plugins/yt_adblock.prx";
+    const std::string targetPlugin = pluginPath;
 
     struct stat originalInfo;
     if (stat(iniPath, &originalInfo) != 0)
@@ -846,8 +1063,7 @@ static bool removePluginsIniEntry(char *errorText, size_t errorTextSize)
         return false;
     }
 
-    // Only remove our section if it has no other plugins in it.
-    // Leave everything else untouched.
+    // Remove only our plugin entry from section.
     std::string filtered;
     filtered.reserve(contents.size());
     bool removedEntry = false;
@@ -908,16 +1124,41 @@ static bool removePluginsIniEntry(char *errorText, size_t errorTextSize)
             nextPosition = firstEnd;
         }
 
-        if (isTargetSection && sectionHasPluginEntry && !sectionHasOtherEntries)
+        if (isTargetSection && sectionHasPluginEntry)
         {
             removedEntry = true;
-            // Drop the entire now-empty section, including its header.
+
+            if (sectionHasOtherEntries)
+            {
+                // Keep the section and its other entries; remove only
+                // exact matches for this plugin path.
+                filtered.append(contents, sectionStart, firstEnd - sectionStart);
+
+                size_t linePosition = firstEnd;
+                while (linePosition < nextPosition)
+                {
+                    size_t newline = contents.find('\n', linePosition);
+                    size_t lineEnd = (newline == std::string::npos || newline >= nextPosition)
+                                         ? nextPosition : newline + 1;
+                    std::string line = contents.substr(linePosition, lineEnd - linePosition);
+                    std::string compareLine = line;
+                    if (!compareLine.empty() && compareLine[compareLine.size() - 1] == '\n')
+                        compareLine.erase(compareLine.size() - 1);
+                    if (!compareLine.empty() && compareLine[compareLine.size() - 1] == '\r')
+                        compareLine.erase(compareLine.size() - 1);
+
+                    if (compareLine != targetPlugin)
+                        filtered.append(contents, linePosition, lineEnd - linePosition);
+
+                    linePosition = lineEnd;
+                }
+            }
+            // If this was the section’s only entry, remove the
+            // empty section and its header.
         }
         else
         {
             filtered.append(contents, sectionStart, nextPosition - sectionStart);
-            if (isTargetSection && sectionHasPluginEntry)
-                removedEntry = true;
         }
 
         position = nextPosition;
@@ -978,18 +1219,112 @@ static bool removeIfPresent(const char *path, char *errorText, size_t errorTextS
     return false;
 }
 
+// Remove a directory tree without following symlinks:
+// unlink files and symlinks directly; open only directories.
+static bool removeDirectoryTree(const char *path, char *errorText, size_t errorTextSize)
+{
+    DIR *directory = opendir(path);
+    if (directory == NULL)
+    {
+        if (errno == ENOENT)
+            return true;
+        snprintf(errorText, errorTextSize, "Could not open directory %.70s (errno %d)", path, errno);
+        return false;
+    }
+
+    bool ok = true;
+    int readError = 0;
+    for (;;)
+    {
+        errno = 0;
+        struct dirent *entry = readdir(directory);
+        if (entry == NULL)
+        {
+            readError = errno;
+            break;
+        }
+
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+            continue;
+
+        char childPath[1024];
+        int pathLength = snprintf(childPath, sizeof(childPath), "%s/%s", path, entry->d_name);
+        if (pathLength <= 0 || (size_t)pathLength >= sizeof(childPath))
+        {
+            snprintf(errorText, errorTextSize, "Directory path is too long during uninstall");
+            ok = false;
+            break;
+        }
+
+        if (unlink(childPath) == 0 || errno == ENOENT)
+            continue;
+
+        int removeErrno = errno;
+        if (removeErrno == EISDIR || removeErrno == EPERM)
+        {
+            if (!removeDirectoryTree(childPath, errorText, errorTextSize))
+            {
+                ok = false;
+                break;
+            }
+        }
+        else
+        {
+            snprintf(errorText, errorTextSize, "Could not delete %.70s (errno %d)",
+                     childPath, removeErrno);
+            ok = false;
+            break;
+        }
+    }
+
+    if (closedir(directory) != 0 && ok)
+    {
+        snprintf(errorText, errorTextSize, "Could not close directory %.70s (errno %d)", path, errno);
+        ok = false;
+    }
+    if (readError != 0 && ok)
+    {
+        snprintf(errorText, errorTextSize, "Could not read directory %.70s (errno %d)", path, readError);
+        ok = false;
+    }
+    if (!ok)
+        return false;
+
+    if (rmdir(path) != 0 && errno != ENOENT)
+    {
+        snprintf(errorText, errorTextSize, "Could not remove directory %.70s (errno %d)", path, errno);
+        return false;
+    }
+    return true;
+}
+
 static bool uninstallManagedFiles(char *errorText, size_t errorTextSize)
 {
-    char iniError[160] = "";
-    char prxError[160] = "";
+    char oldIniError[160] = "";
+    char newIniError[160] = "";
+    char oldPrxError[160] = "";
+    char newPrxError[160] = "";
     char configError[160] = "";
-    bool iniOk = removePluginsIniEntry(iniError, sizeof(iniError));
-    bool prxOk = removeIfPresent("/data/GoldHEN/plugins/yt_adblock.prx", prxError, sizeof(prxError));
-    bool configOk = removeIfPresent(CONFIG_PATH, configError, sizeof(configError));
+    char cacheError[160] = "";
 
-    if (!iniOk || !prxOk || !configOk)
+    bool oldIniOk = removePluginsIniEntry("/data/GoldHEN/plugins/yt_adblock.prx",
+                                          oldIniError, sizeof(oldIniError));
+    bool newIniOk = removePluginsIniEntry("/data/GoldHEN/plugins/ps4_yt_adsponsorblock.prx",
+                                          newIniError, sizeof(newIniError));
+    bool oldPrxOk = removeIfPresent("/data/GoldHEN/plugins/yt_adblock.prx",
+                                    oldPrxError, sizeof(oldPrxError));
+    bool newPrxOk = removeIfPresent("/data/GoldHEN/plugins/ps4_yt_adsponsorblock.prx",
+                                    newPrxError, sizeof(newPrxError));
+    bool configOk = removeIfPresent(CONFIG_PATH, configError, sizeof(configError));
+    bool cacheOk = removeDirectoryTree("/data/ytadsponsorblock", cacheError, sizeof(cacheError));
+
+    if (!oldIniOk || !newIniOk || !oldPrxOk || !newPrxOk || !configOk || !cacheOk)
     {
-        const char *first = !iniOk ? iniError : (!prxOk ? prxError : configError);
+        const char *first = !oldIniOk ? oldIniError :
+                            (!newIniOk ? newIniError :
+                            (!oldPrxOk ? oldPrxError :
+                            (!newPrxOk ? newPrxError :
+                            (!configOk ? configError : cacheError))));
         snprintf(errorText, errorTextSize, "%s", first);
         return false;
     }
@@ -998,11 +1333,13 @@ static bool uninstallManagedFiles(char *errorText, size_t errorTextSize)
     return true;
 }
 
-// The latest download URL redirects to the actual PRX file.
+// Check for a PRX update and download it if needed.
+#define LATEST_PRX_RELEASE_API_URL "https://api.github.com/repos/FourZeroCode/ps4_yt_adsponsorblock/releases/latest"
 static const char *LATEST_PRX_URL =
-    "https://github.com/FourZeroCode/yt_adblock_sponsorblock_ps4/releases/latest/download/yt_adblock.prx";
-static const char *DOWNLOADED_PRX_PATH =
-    "/data/GoldHEN/plugins/yt_adblock.prx.download";
+    "https://github.com/FourZeroCode/ps4_yt_adsponsorblock/releases/latest/download/ps4_yt_adsponsorblock.prx";
+#define PRX_CACHE_DIRECTORY "/data/ytadsponsorblock"
+#define PRX_DOWNLOAD_TEMP_PATH "/data/ytadsponsorblock/prx-download.tmp"
+static const char *DOWNLOADED_PRX_PATH = PRX_DOWNLOAD_TEMP_PATH;
 
 // Only accept certificates that pass verification.
 static int verifyGitHubCertificate(int libsslId, unsigned int verifyErr,
@@ -1061,7 +1398,7 @@ static bool extractRedirectLocation(int requestId, char *location, size_t locati
     return false;
 }
 
-static bool downloadLatestPrx(const char *outputPath)
+static bool downloadLatestPrx(const char *outputPath, uint64_t *downloadedSize)
 {
     int netPoolId = -1;
     int sslContextId = -1;
@@ -1129,10 +1466,10 @@ static bool downloadLatestPrx(const char *outputPath)
         goto cleanup;
     }
 
-    // OpenOrbis Http.h declares this without parameters, but the actual
-    // function takes an ID and size. Use the correct signature here.
-    // Increase the header limit from 5 KB to 64 KB.
-    // GitHub redirects sometimes have large headers.
+    // OpenOrbis declares this without arguments, but the actual
+    // function takes an ID and size.
+    // Raise the header limit to 64 KB.
+    // GitHub can return large redirect headers.
     headerLimitResult = setResponseHeaderMaxSize(templateId, 64 * 1024);
     if (headerLimitResult < 0)
     {
@@ -1141,8 +1478,7 @@ static bool downloadLatestPrx(const char *outputPath)
         goto cleanup;
     }
 
-    // Auto-redirect is declared incorrectly in OpenOrbis,
-    // so follow the GitHub redirects.
+    // Follow GitHub redirects.
     for (int redirectCount = 0; redirectCount <= 5; ++redirectCount)
     {
         connectionId = sceHttpCreateConnectionWithURL(templateId, currentUrl, 1);
@@ -1162,8 +1498,8 @@ static bool downloadLatestPrx(const char *outputPath)
             int err = 0;
             sceHttpGetLastErrno(requestId, &err);
 
-            // 0x80431073 means the PS4 HTTP stack rejected an oversized response
-            // header. Let the installer use the bundled PRX if the download fails.
+            // 0x80431073 indicates the PS4 HTTP stack rejected a large
+            // response header. Fall back to the bundled PRX.
             if ((unsigned int)err == 0x80431073U)
                 snprintf(downloadFailureReason, sizeof(downloadFailureReason),
                          "response header too large (0x80431073)");
@@ -1261,6 +1597,8 @@ static bool downloadLatestPrx(const char *outputPath)
         goto cleanup;
     }
     outputFd = -1;
+    if (downloadedSize)
+        *downloadedSize = totalRead;
     ok = true;
     snprintf(downloadFailureReason, sizeof(downloadFailureReason), "downloaded successfully");
 
@@ -1598,7 +1936,160 @@ cleanup:
     return ok;
 }
 
-// Native PS4 progress dialog used only by the SponsorBlockConfig PKG updater.
+
+// Compare numeric versions such as 1.01 or 1.2.3.
+static int compareReleaseVersions(const std::string &left, const std::string &right)
+{
+    unsigned int a[3], b[3];
+    if (!parseReleaseVersion(left, a) || !parseReleaseVersion(right, b))
+        return 0;
+    for (int i = 0; i < 3; ++i)
+    {
+        if (a[i] > b[i]) return 1;
+        if (a[i] < b[i]) return -1;
+    }
+    return 0;
+}
+
+static bool isUsableCachedPrx(const char *path)
+{
+    // Existing cache files are keyed by release tag. New downloads
+    // are validated before being moved into the cache.
+    // Leave existing cached files alone.
+    int fd = open(path, O_RDONLY);
+    if (fd < 0)
+        return false;
+
+    // A one-byte read checks that the path is a readable file.
+    // It does not check the file size.
+    unsigned char probe;
+    ssize_t readResult = read(fd, &probe, 1);
+    close(fd);
+    return readResult >= 0;
+}
+
+static bool buildCachedPrxPath(const std::string &releaseTag, char *path, size_t pathSize)
+{
+    unsigned int parts[3];
+    if (!parseReleaseVersion(releaseTag, parts))
+        return false;
+
+    // Use the release tag for the cache filename:
+    // v1.2.3 becomes /data/ytadsponsorblock/v1.2.3.prx
+    for (size_t i = 0; i < releaseTag.size(); ++i)
+    {
+        char c = releaseTag[i];
+        if (!((c >= '0' && c <= '9') || c == '.' || c == 'v' || c == 'V'))
+            return false;
+    }
+
+    int written = snprintf(path, pathSize, PRX_CACHE_DIRECTORY "/%s.prx",
+                           releaseTag.c_str());
+    return written > 0 && (size_t)written < pathSize;
+}
+
+// Look only for the filename matching this exact tag.
+static bool findCachedPrxForVersion(const std::string &releaseTag,
+                                    char *path, size_t pathSize)
+{
+    char taggedPath[512] = "";
+    if (!buildCachedPrxPath(releaseTag, taggedPath, sizeof(taggedPath)))
+        return false;
+
+    // Cache filename: the exact GitHub tag, e.g. v1.0.0.prx.
+    if (isUsableCachedPrx(taggedPath))
+    {
+        int written = snprintf(path, pathSize, "%s", taggedPath);
+        return written > 0 && (size_t)written < pathSize;
+    }
+
+    // Move files from the old version1.0.0.prx naming scheme
+    // into the tag-based cache without downloading again.
+    std::string version = releaseTag;
+    if (!version.empty() && (version[0] == 'v' || version[0] == 'V'))
+        version.erase(0, 1);
+
+    char legacyPath[512];
+    int legacyWritten = snprintf(legacyPath, sizeof(legacyPath),
+                                 PRX_CACHE_DIRECTORY "/version%s.prx", version.c_str());
+    if (legacyWritten <= 0 || (size_t)legacyWritten >= sizeof(legacyPath) ||
+        !isUsableCachedPrx(legacyPath))
+        return false;
+
+    // Rename the cache entry to the tag-based filename.
+    // If rename fails, keep using the old path rather than
+    // downloading the PRX again.
+    if (rename(legacyPath, taggedPath) == 0)
+        legacyPath[0] = '\0';
+
+    const char *selectedPath = legacyPath[0] == '\0' ? taggedPath : legacyPath;
+    int written = snprintf(path, pathSize, "%s", selectedPath);
+    return written > 0 && (size_t)written < pathSize;
+}
+
+static bool findNewestCachedPrx(char *path, size_t pathSize, std::string *foundVersion = NULL)
+{
+    DIR *directory = opendir(PRX_CACHE_DIRECTORY);
+    if (!directory) return false;
+
+    bool found = false;
+    std::string newestVersion;
+    char newestPath[512] = "";
+    struct dirent *entry;
+    while ((entry = readdir(directory)) != NULL)
+    {
+        const char *name = entry->d_name;
+        size_t length = strlen(name);
+        if (length <= 4 || strcmp(name + length - 4, ".prx") != 0)
+            continue;
+
+        std::string version;
+        if (strncmp(name, "version", 7) == 0 && length > 11)
+            version.assign(name + 7, length - 11); // Old cache filename
+        else
+            version.assign(name, length - 4);      // Release-tag cache filename
+
+        unsigned int parts[3];
+        if (!parseReleaseVersion(version, parts))
+            continue;
+
+        char candidate[512];
+        int written = snprintf(candidate, sizeof(candidate), PRX_CACHE_DIRECTORY "/%s", name);
+        if (written <= 0 || (size_t)written >= sizeof(candidate) ||
+            !isUsableCachedPrx(candidate))
+            continue;
+
+        if (!found || compareReleaseVersions(version, newestVersion) > 0)
+        {
+            found = true;
+            newestVersion = version;
+            snprintf(newestPath, sizeof(newestPath), "%s", candidate);
+        }
+    }
+    closedir(directory);
+
+    if (!found || strlen(newestPath) >= pathSize)
+        return false;
+    snprintf(path, pathSize, "%s", newestPath);
+    if (foundVersion) *foundVersion = newestVersion;
+    return true;
+}
+
+static bool getLatestPrxReleaseTag(std::string &releaseTag)
+{
+    // The leading # intentionally disables network checks in GUI builds.
+    if (LATEST_PRX_RELEASE_API_URL[0] == '#')
+        return false;
+
+    std::string response;
+    char errorText[160] = "";
+    if (!httpGetToString(LATEST_PRX_RELEASE_API_URL, response, errorText, sizeof(errorText)))
+        return false;
+
+    return jsonGetString(response, "tag_name", releaseTag);
+}
+
+// Native PS4 progress dialog used by the SponsorBlockConfig PKG updater.
 static bool openAppUpdateProgressDialog(char *errorText, size_t errorTextSize)
 {
     if (!ensureDialogServices(errorText, errorTextSize))
@@ -2002,7 +2493,7 @@ static int showAppUpdateDownloadedDialog(char *errorText, size_t errorTextSize)
     param.baseParam.magic = (uint32_t)(ORBIS_COMMON_DIALOG_MAGIC_NUMBER + (uint64_t)&param.baseParam);
     param.size = sizeof(OrbisMsgDialogParam);
     param.mode = ORBIS_MSG_DIALOG_MODE_USER_MSG;
-    userMsgParam.msg = "Update downloaded successfully!\n\nTo install the update:\n1. Open GoldHEN > Debug Settings.\n2. Under Package Installer, disable Enable Background Installation.\n3. Open Package Installer and install SponsorBlockConfig-update.pkg.\n4. Confirm the update/reinstall if prompted.\n\nAfter installation, you can enable Background Installation again.";
+    userMsgParam.msg = "Update downloaded successfully!\n\nTo install the update:\n1. Open GoldHEN > Debug Settings.\n2. Under Package Installer, disable Enable Background Installation.\n3. Open Package Installer and install AdlessTube-update.pkg.\n4. Confirm the update/reinstall if prompted.\n\nAfter installation, you can enable Background Installation again.";
     userMsgParam.buttonType = ORBIS_MSG_DIALOG_BUTTON_TYPE_OK;
     param.userMsgParam = &userMsgParam;
     rc = sceMsgDialogOpen(&param);
@@ -2092,13 +2583,17 @@ static int showAppUpdateFailedDialog(const char *reason, char *errorText, size_t
     return 0;
 }
 
-static bool installPrx(char *errorText, size_t errorTextSize, bool *iniEntryAdded, bool *usedBundledFallback)
+static bool installPrx(char *errorText, size_t errorTextSize, bool *iniEntryAdded, bool *usedBundledFallback, bool *usedCachedFallback)
 {
-    const char *bundledSourcePath = "/app0/assets/misc/yt_adblock.prx";
-    const char *destinationPath = "/data/GoldHEN/plugins/yt_adblock.prx";
+    const char *bundledSourcePath = "/app0/assets/misc/ps4_yt_adsponsorblock.prx";
+    const char *destinationPath = "/data/GoldHEN/plugins/ps4_yt_adsponsorblock.prx";
+    char selectedCachePath[512] = "";
     const char *sourcePath = bundledSourcePath;
-    if (usedBundledFallback)
-        *usedBundledFallback = false;
+    bool usedCache = false;
+    bool sourceIsFreshDownload = false;
+    uint64_t expectedPrxSize = 0;
+    if (usedBundledFallback) *usedBundledFallback = false;
+    if (usedCachedFallback) *usedCachedFallback = false;
 
     if (mkdir("/data/GoldHEN", 0777) != 0 && errno != EEXIST)
     {
@@ -2111,30 +2606,149 @@ static bool installPrx(char *errorText, size_t errorTextSize, bool *iniEntryAdde
         return false;
     }
 
-    // Try downloading the latest PRX first.
-    // If it fails, use the PRX bundled with the app.
-    if (downloadLatestPrx(DOWNLOADED_PRX_PATH))
-        sourcePath = DOWNLOADED_PRX_PATH;
-    else if (usedBundledFallback)
-        *usedBundledFallback = true;
+    // Remove the old AdBlock PRX and its GoldHEN entry before
+    // installing SponsorBlock. Leave other plugin files untouched.
+    if (!removePluginsIniEntry("/data/GoldHEN/plugins/yt_adblock.prx",
+                               errorText, errorTextSize))
+        return false;
+    if (!removeIfPresent("/data/GoldHEN/plugins/yt_adblock.prx",
+                         errorText, errorTextSize))
+        return false;
 
+    // Create the PRX cache directory.
+    if (mkdir(PRX_CACHE_DIRECTORY, 0777) != 0 && errno != EEXIST)
+    {
+        snprintf(errorText, errorTextSize, "PRX cache directory creation failed (errno %d)", errno);
+        return false;
+    }
+
+    // Get the latest stable PRX tag from GitHub. If the request fails,
+    // use the newest valid cache, then the bundled PRX.
+    std::string latestTag;
+    char matchingCachePath[512] = "";
+    bool haveLatestTag = getLatestPrxReleaseTag(latestTag);
+    bool haveMatchingCache = haveLatestTag &&
+                             findCachedPrxForVersion(latestTag, matchingCachePath,
+                                                     sizeof(matchingCachePath));
+
+    if (haveMatchingCache)
+    {
+        sourcePath = matchingCachePath;
+        usedCache = true;
+    }
+    else if (haveLatestTag && downloadLatestPrx(DOWNLOADED_PRX_PATH, &expectedPrxSize))
+    {
+        char newCachePath[512] = "";
+        if (!buildCachedPrxPath(latestTag, newCachePath, sizeof(newCachePath)))
+        {
+            snprintf(errorText, errorTextSize, "GitHub release tag is not a valid cache version");
+            unlink(DOWNLOADED_PRX_PATH);
+            return false;
+        }
+
+        // Remove an existing cache file before replacing it. If the
+        // path is a stale directory from an earlier run, unlink() fails;
+        // remove only the known temp file, then call rmdir().
+        // Avoid lstat(); it can return EPERM
+        if (unlink(newCachePath) != 0 && errno != ENOENT)
+        {
+            int removeTargetErrno = errno;
+            char misplacedDownload[640];
+            int misplacedLength = snprintf(misplacedDownload, sizeof(misplacedDownload),
+                                           "%s/prx-download.tmp", newCachePath);
+            if (misplacedLength <= 0 || (size_t)misplacedLength >= sizeof(misplacedDownload))
+            {
+                snprintf(errorText, errorTextSize, "old cache directory path is too long");
+                return false;
+            }
+
+            // Try this cleanup only for errors typically returned when
+            // unlink() is called on a directory. Don’t recurse or
+            // remove anything else.
+            if (removeTargetErrno != EISDIR && removeTargetErrno != EPERM)
+            {
+                snprintf(errorText, errorTextSize,
+                         "could not prepare versioned cache path (errno %d)", removeTargetErrno);
+                return false;
+            }
+            if (unlink(misplacedDownload) != 0 && errno != ENOENT)
+            {
+                snprintf(errorText, errorTextSize,
+                         "could not remove misplaced PRX from old cache directory (errno %d)", errno);
+                return false;
+            }
+            if (rmdir(newCachePath) != 0)
+            {
+                snprintf(errorText, errorTextSize,
+                         "could not remove stale versioned cache directory (errno %d)", errno);
+                return false;
+            }
+        }
+
+        // The download passed the byte-count, content-length, and
+        // 64 KiB–20 MiB checks. Rename it to the cache file.
+        if (rename(DOWNLOADED_PRX_PATH, newCachePath) == 0)
+        {
+            // The downloader already checked the byte count and
+            // content length. Don’t check st_size again: on this PS4
+            // filesystem, stat() reports 544 for a valid renamed PRX.
+            snprintf(selectedCachePath, sizeof(selectedCachePath), "%s", newCachePath);
+            sourcePath = selectedCachePath;
+            sourceIsFreshDownload = true;
+        }
+        else
+        {
+            int cacheRenameErrno = errno;
+            // Cache promotion failed; keep using the downloaded file
+            // for this install.
+            // The temp file was validated during download. If moving it
+            // into the cache fails, install from the temp path.
+            sourcePath = DOWNLOADED_PRX_PATH;
+            sourceIsFreshDownload = true;
+            (void)cacheRenameErrno;
+        }
+    }
+    else
+    {
+        std::string cachedVersion;
+        if (findNewestCachedPrx(selectedCachePath, sizeof(selectedCachePath), &cachedVersion))
+        {
+            sourcePath = selectedCachePath;
+            usedCache = true;
+        }
+        else if (!haveLatestTag && usedBundledFallback)
+        {
+            *usedBundledFallback = true;
+        }
+    }
+
+    // Keep the bundled PRX fallback: open the packaged file
+    // directly instead of applying cache checks to it.
+    // This also keeps GUI builds working with GitHub checks off.
+
+    // Use the cache as a fallback only if the release check failed.
+    // A cache for the checked release is a normal install.
+    if (usedCachedFallback) *usedCachedFallback = usedCache && !haveLatestTag;
     int sourceFd = open(sourcePath, O_RDONLY);
     if (sourceFd < 0)
     {
-        if (sourcePath == DOWNLOADED_PRX_PATH)
+        if (strcmp(sourcePath, DOWNLOADED_PRX_PATH) == 0)
             unlink(DOWNLOADED_PRX_PATH);
         snprintf(errorText, errorTextSize, "PRX source open failed (errno %d)", errno);
         return false;
     }
 
-    // Copy the PRX into place.
-    int destinationFd = open(destinationPath, O_WRONLY | O_CREAT, 0777);
+    // Copy to a temp file beside the destination, then rename it
+    // into place so a partial copy never replaces the live PRX.
+    const char *destinationTempPath = "/data/GoldHEN/plugins/ps4_yt_adsponsorblock.prx.tmp";
+    unlink(destinationTempPath);
+    int destinationFd = open(destinationTempPath, O_WRONLY | O_CREAT | O_TRUNC, 0777);
     if (destinationFd < 0)
     {
         int savedErrno = errno;
         close(sourceFd);
-        if (sourcePath == DOWNLOADED_PRX_PATH) unlink(DOWNLOADED_PRX_PATH);
-        snprintf(errorText, errorTextSize, "PRX destination open failed (errno %d)", savedErrno);
+        if (strcmp(sourcePath, DOWNLOADED_PRX_PATH) == 0) unlink(DOWNLOADED_PRX_PATH);
+        snprintf(errorText, errorTextSize, "PRX temporary destination open failed (errno %d)", savedErrno);
         return false;
     }
 
@@ -2148,7 +2762,8 @@ static bool installPrx(char *errorText, size_t errorTextSize, bool *iniEntryAdde
         {
             close(sourceFd);
             close(destinationFd);
-            if (sourcePath == DOWNLOADED_PRX_PATH) unlink(DOWNLOADED_PRX_PATH);
+            unlink(destinationTempPath);
+            if (strcmp(sourcePath, DOWNLOADED_PRX_PATH) == 0) unlink(DOWNLOADED_PRX_PATH);
             snprintf(errorText, errorTextSize, "PRX permission change failed (errno %d)", chmodErrno);
             return false;
         }
@@ -2161,13 +2776,15 @@ static bool installPrx(char *errorText, size_t errorTextSize, bool *iniEntryAdde
         int savedErrno = errno;
         close(sourceFd);
         close(destinationFd);
-        if (sourcePath == DOWNLOADED_PRX_PATH) unlink(DOWNLOADED_PRX_PATH);
+        unlink(destinationTempPath);
+        if (strcmp(sourcePath, DOWNLOADED_PRX_PATH) == 0) unlink(DOWNLOADED_PRX_PATH);
         snprintf(errorText, errorTextSize, "PRX truncate failed (errno %d)", savedErrno);
         return false;
     }
 
     char buffer[16384];
     bool ok = true;
+    uint64_t copiedPrxSize = 0;
     int savedErrno = 0;
     for (;;)
     {
@@ -2188,8 +2805,14 @@ static bool installPrx(char *errorText, size_t errorTextSize, bool *iniEntryAdde
             savedErrno = errno;
             break;
         }
+        copiedPrxSize += (uint64_t)bytesRead;
     }
 
+    if (ok && fsync(destinationFd) != 0)
+    {
+        ok = false;
+        savedErrno = errno;
+    }
     if (close(sourceFd) != 0 && ok)
     {
         ok = false;
@@ -2201,12 +2824,42 @@ static bool installPrx(char *errorText, size_t errorTextSize, bool *iniEntryAdde
         savedErrno = errno;
     }
 
-    if (sourcePath == DOWNLOADED_PRX_PATH)
+    if (strcmp(sourcePath, DOWNLOADED_PRX_PATH) == 0)
         unlink(DOWNLOADED_PRX_PATH);
 
     if (!ok)
     {
+        unlink(destinationTempPath);
         snprintf(errorText, errorTextSize, "PRX copy failed (errno %d)", savedErrno);
+        return false;
+    }
+
+    // Check the copied file size before replacing the installed PRX.
+    if (sourceIsFreshDownload)
+    {
+        if (copiedPrxSize != expectedPrxSize)
+        {
+            unlink(destinationTempPath);
+            snprintf(errorText, errorTextSize,
+                     "PRX copy size mismatch (copied %llu, downloaded %llu)",
+                     (unsigned long long)copiedPrxSize,
+                     (unsigned long long)expectedPrxSize);
+            return false;
+        }
+    }
+    else if (strcmp(sourcePath, bundledSourcePath) != 0 &&
+             !isUsableCachedPrx(destinationTempPath))
+    {
+        unlink(destinationTempPath);
+        snprintf(errorText, errorTextSize, "copied PRX failed size validation");
+        return false;
+    }
+
+    if (rename(destinationTempPath, destinationPath) != 0)
+    {
+        int renameErrno = errno;
+        unlink(destinationTempPath);
+        snprintf(errorText, errorTextSize, "PRX final rename failed (errno %d)", renameErrno);
         return false;
     }
 
@@ -2216,6 +2869,26 @@ static bool installPrx(char *errorText, size_t errorTextSize, bool *iniEntryAdde
 
     errorText[0] = '\0';
     return true;
+}
+
+// Close the screen with two black shutters, leaving the UI visible
+// until they cover it. FrameWait keeps the animation paced.
+static void playClosingAnimation(Scene2D *scene, int *frameID, Color black)
+{
+    const int animationFrames = 45;
+
+    for (int frame = 0; frame < animationFrames; ++frame)
+    {
+        const int barHeight = ((FRAME_HEIGHT / 2) * (frame + 1)) / animationFrames;
+
+        scene->DrawRectangle(0, 0, FRAME_WIDTH, barHeight, black);
+        scene->DrawRectangle(0, FRAME_HEIGHT - barHeight, FRAME_WIDTH, barHeight, black);
+
+        scene->SubmitFlip(*frameID);
+        scene->FrameWait(*frameID);
+        scene->FrameBufferSwap();
+        ++(*frameID);
+    }
 }
 
 int main(void)
@@ -2238,11 +2911,15 @@ int main(void)
 
     FT_Face titleFont;
     FT_Face menuFont;
+    FT_Face categoryFont;
     FT_Face smallFont;
+    FT_Face legendFont;
     const char *fontPath = "/app0/assets/fonts/Gontserrat-Regular.ttf";
-    if (!scene->InitFont(&titleFont, fontPath, 56) ||
+    if (!scene->InitFont(&titleFont, fontPath, 50) ||
         !scene->InitFont(&menuFont, fontPath, 32) ||
-        !scene->InitFont(&smallFont, fontPath, 20))
+        !scene->InitFont(&categoryFont, fontPath, 32) ||
+        !scene->InitFont(&smallFont, fontPath, 20) ||
+        !scene->InitFont(&legendFont, fontPath, 24))
     {
         DEBUGLOG << "Failed to initialize font: " << fontPath;
         return 1;
@@ -2261,8 +2938,11 @@ int main(void)
     int downHoldFrames = 0;
     const int NAV_REPEAT_DELAY_FRAMES = 3;
     const int NAV_REPEAT_INTERVAL_FRAMES = 1;
-    char status[256] = "Choose categories, then save and install PS4 YT AdBlock + SponsorBlock.";
+    char status[256] = "Select your categories and install AdlessTube.";
     bool statusIsError = false;
+    int preferencesStatusFramesRemaining = 0;
+    bool closeConfirmPending = false;
+    bool exitRequested = false;
     char loadError[160];
     if (!loadConfig(loadError, sizeof(loadError)))
     {
@@ -2275,7 +2955,7 @@ int main(void)
         for (int i = 0; i < CATEGORY_COUNT; ++i)
             if (selected[i]) ++initiallySelected;
         if (initiallySelected > 0)
-            snprintf(status, sizeof(status), "Loaded %d saved categories. Adjust settings, then save when ready.", initiallySelected);
+            snprintf(status, sizeof(status), "Loaded %d saved categories. Configure AdlessTube to your liking.", initiallySelected);
     }
 
     // Check stable GitHub releases once at startup. Network failures never block the app.
@@ -2312,12 +2992,104 @@ int main(void)
         }
     }
 
+    // Put the three main settings in one row above the categories.
+    auto moveCursorUp = [&]()
+    {
+        if (cursor <= 2)
+        {
+            cursor = MENU_ITEM_COUNT - 1;
+        }
+        else
+        {
+            const int row = (cursor - 3) % 6;
+            if (row == 0)
+                cursor = (cursor >= 9) ? 2 : 1;
+            else
+                --cursor;
+        }
+    };
+    auto moveCursorDown = [&]()
+    {
+        if (cursor <= 2)
+        {
+            cursor = (cursor == 2) ? 9 : 3;
+        }
+        else
+        {
+            const int row = (cursor - 3) % 6;
+            if (row == 5)
+                cursor = (cursor >= 9) ? 2 : 1;
+            else
+                ++cursor;
+        }
+    };
+
+    // Save each setting or category change immediately.
+    auto saveAfterChange = [&]()
+    {
+        int savedCount = 0;
+        char saveError[160];
+        if (saveConfig(saveError, sizeof(saveError), &savedCount))
+        {
+            snprintf(status, sizeof(status), "Preferences updated successfully.");
+            statusIsError = false;
+            preferencesStatusFramesRemaining = 20; // About two seconds at the current frame rate.
+        }
+        else
+        {
+            snprintf(status, sizeof(status), "Save failed: %.210s", saveError);
+            statusIsError = true;
+        }
+    };
+
     for (;;)
     {
+        if (preferencesStatusFramesRemaining > 0)
+        {
+            --preferencesStatusFramesRemaining;
+            if (preferencesStatusFramesRemaining == 0 &&
+                strcmp(status, "Preferences updated successfully.") == 0)
+                status[0] = '\0';
+        }
+
         controller.Poll();
+
+		// Press Circle twice to exit. Any other button cancels.
+        if (controller.Pressed(ORBIS_PAD_BUTTON_CIRCLE))
+        {
+            if (closeConfirmPending)
+            {
+                exitRequested = true;
+            }
+            else
+            {
+                closeConfirmPending = true;
+                // Keep the in-app message as a fallback. Also try the
+                // native system notification.
+                status[0] = '\0';
+                statusIsError = false;
+                preferencesStatusFramesRemaining = 0;
+                sendSystemNotification("Press again to exit");
+            }
+        }
+        else if (closeConfirmPending &&
+                 (controller.Pressed(ORBIS_PAD_BUTTON_UP) ||
+                  controller.Pressed(ORBIS_PAD_BUTTON_DOWN) ||
+                  controller.Pressed(ORBIS_PAD_BUTTON_LEFT) ||
+                  controller.Pressed(ORBIS_PAD_BUTTON_RIGHT) ||
+                  controller.Pressed(ORBIS_PAD_BUTTON_CROSS) ||
+                  controller.Pressed(ORBIS_PAD_BUTTON_OPTIONS) ||
+                  controller.Pressed(ORBIS_PAD_BUTTON_TRIANGLE) ||
+                  controller.Pressed(ORBIS_PAD_BUTTON_SQUARE)))
+        {
+            closeConfirmPending = false;
+        }
+
+        if (!exitRequested)
+        {
         if (controller.Pressed(ORBIS_PAD_BUTTON_UP))
         {
-            cursor = (cursor + MENU_ITEM_COUNT - 1) % MENU_ITEM_COUNT;
+            moveCursorUp();
             upHoldFrames = 0;
         }
         else if (controller.Held(ORBIS_PAD_BUTTON_UP))
@@ -2325,7 +3097,7 @@ int main(void)
             ++upHoldFrames;
             if (upHoldFrames >= NAV_REPEAT_DELAY_FRAMES &&
                 (upHoldFrames - NAV_REPEAT_DELAY_FRAMES) % NAV_REPEAT_INTERVAL_FRAMES == 0)
-                cursor = (cursor + MENU_ITEM_COUNT - 1) % MENU_ITEM_COUNT;
+                moveCursorUp();
         }
         else
         {
@@ -2334,7 +3106,7 @@ int main(void)
 
         if (controller.Pressed(ORBIS_PAD_BUTTON_DOWN))
         {
-            cursor = (cursor + 1) % MENU_ITEM_COUNT;
+            moveCursorDown();
             downHoldFrames = 0;
         }
         else if (controller.Held(ORBIS_PAD_BUTTON_DOWN))
@@ -2342,42 +3114,48 @@ int main(void)
             ++downHoldFrames;
             if (downHoldFrames >= NAV_REPEAT_DELAY_FRAMES &&
                 (downHoldFrames - NAV_REPEAT_DELAY_FRAMES) % NAV_REPEAT_INTERVAL_FRAMES == 0)
-                cursor = (cursor + 1) % MENU_ITEM_COUNT;
+                moveCursorDown();
         }
         else
         {
             downHoldFrames = 0;
         }
-        if (controller.Pressed(ORBIS_PAD_BUTTON_SQUARE))
+
+        // Move across the top-row settings, or between category
+        // columns on the same row.
+        if (controller.Pressed(ORBIS_PAD_BUTTON_LEFT))
+        {
+            if (cursor == 1)
+                cursor = 0;
+            else if (cursor == 2)
+                cursor = 1;
+            else if (cursor >= 9 && cursor <= 14)
+                cursor -= 6;
+        }
+        else if (controller.Pressed(ORBIS_PAD_BUTTON_RIGHT))
         {
             if (cursor == 0)
-                skipModeAuto = !skipModeAuto;
-            else
-                selected[cursor - 1] = !selected[cursor - 1];
-            status[0] = '\0';
+                cursor = 1;
+            else if (cursor == 1)
+                cursor = 2;
+            else if (cursor >= 3 && cursor <= 8)
+                cursor += 6;
         }
 
-        // R2 selects everything unless everything is already checked.
-        // If so, clear the selection instead.
-        if (controller.Pressed(ORBIS_PAD_BUTTON_R2))
+        if (controller.Pressed(ORBIS_PAD_BUTTON_CROSS))
         {
-            bool allSelected = true;
-            for (int i = 0; i < CATEGORY_COUNT; ++i)
-            {
-                if (!selected[i])
-                {
-                    allSelected = false;
-                    break;
-                }
-            }
+            if (cursor == 0)
+                skipMode = (skipMode + 1) % 3;
+            else if (cursor == 1)
+                adBlockEnabled = !adBlockEnabled;
+            else if (cursor == 2)
+                sponsorBlockEnabled = !sponsorBlockEnabled;
+            else
+                selected[cursor - 3] = !selected[cursor - 3];
 
-            const bool selectAll = !allSelected;
-            for (int i = 0; i < CATEGORY_COUNT; ++i)
-                selected[i] = selectAll;
-
-            status[0] = '\0';
-            statusIsError = false;
+            saveAfterChange();
         }
+
         if (controller.Pressed(ORBIS_PAD_BUTTON_OPTIONS))
         {
             char errorText[160];
@@ -2386,11 +3164,13 @@ int main(void)
             {
                 if (uninstallManagedFiles(errorText, sizeof(errorText)))
                 {
-                    snprintf(status, sizeof(status), "SponsorBlock config and YT AdBlock plugin uninstalled.");
+                    snprintf(status, sizeof(status), "AdlessTube uninstalled.");
                     statusIsError = false;
                     for (int i = 0; i < CATEGORY_COUNT; ++i)
                         selected[i] = false;
-                    skipModeAuto = false;
+                    skipMode = 0;
+                    adBlockEnabled = true;
+                    sponsorBlockEnabled = true;
                 }
                 else
                 {
@@ -2412,34 +3192,24 @@ int main(void)
 
         if (controller.Pressed(ORBIS_PAD_BUTTON_TRIANGLE))
         {
-            int count = 0;
-            char errorText[160];
-            if (saveConfig(errorText, sizeof(errorText), &count))
+            bool allSelected = true;
+            for (int i = 0; i < CATEGORY_COUNT; ++i)
             {
-                snprintf(status, sizeof(status), "SponsorBlock settings saved successfully.");
-                statusIsError = false;
+                if (!selected[i])
+                {
+                    allSelected = false;
+                    break;
+                }
+            }
 
-                int saveChoice = showConfigSavedDialog(errorText, sizeof(errorText));
-                if (saveChoice == 1)
-                {
-                    sceSystemServiceLoadExec("exit", NULL);
-                    return 0;
-                }
-                else if (saveChoice < 0)
-                {
-                    snprintf(status, sizeof(status), "Settings saved; dialog failed: %.120s", errorText);
-                    statusIsError = true;
-                }
-                // Keep the saved message on screen when going back.
-            }
-            else
-            {
-                snprintf(status, sizeof(status), "Save failed: %s", errorText);
-                statusIsError = true;
-            }
+            const bool selectAll = !allSelected;
+            for (int i = 0; i < CATEGORY_COUNT; ++i)
+                selected[i] = selectAll;
+
+            saveAfterChange();
         }
 
-        if (controller.Pressed(ORBIS_PAD_BUTTON_CROSS))
+        if (controller.Pressed(ORBIS_PAD_BUTTON_SQUARE))
         {
             int count = 0;
             char errorText[160];
@@ -2450,38 +3220,39 @@ int main(void)
                 {
                     bool iniEntryAdded = false;
                     bool usedBundledFallback = false;
+                    bool usedCachedFallback = false;
                     struct stat existingPrxBeforeInstall;
-                    bool wasUpdate = stat("/data/GoldHEN/plugins/yt_adblock.prx",
+                    bool wasUpdate = stat("/data/GoldHEN/plugins/ps4_yt_adsponsorblock.prx",
                                           &existingPrxBeforeInstall) == 0 &&
                                      S_ISREG(existingPrxBeforeInstall.st_mode);
-                    if (installPrx(errorText, sizeof(errorText), &iniEntryAdded, &usedBundledFallback))
+                    if (installPrx(errorText, sizeof(errorText), &iniEntryAdded, &usedBundledFallback, &usedCachedFallback))
                     {
-                        snprintf(status, sizeof(status), iniEntryAdded ? "PS4 YT AdBlock + SponsorBlock installed; YouTube entry added" : "PS4 YT AdBlock + SponsorBlock installed");
+                        snprintf(status, sizeof(status), iniEntryAdded ? "AdlessTube installed, YouTube entry added" : "AdlessTube installed");
                         statusIsError = false;
                         // Close the app after OK.
-                        int successChoice = showSuccessDialog(wasUpdate, usedBundledFallback, errorText, sizeof(errorText));
+                        int successChoice = showSuccessDialog(wasUpdate, usedBundledFallback, usedCachedFallback, errorText, sizeof(errorText));
                         if (successChoice == 1)
-                            sceSystemServiceLoadExec("exit", NULL);
+                            exitRequested = true;
                         else if (successChoice < 0)
                         {
-                            snprintf(status, sizeof(status), "Installed successfully; dialog failed: %.110s", errorText);
+                            snprintf(status, sizeof(status), "Installed successfully, dialog failed: %.110s", errorText);
                             statusIsError = true;
                         }
                     }
                     else
                     {
-                        snprintf(status, sizeof(status), "SponsorBlock Config saved; install failed: %.130s", errorText);
+                        snprintf(status, sizeof(status), "Settings saved, install failed: %.130s", errorText);
                         statusIsError = true;
                     }
                 }
                 else if (installChoice == 0)
                 {
-                    snprintf(status, sizeof(status), "SponsorBlock Config saved; PS4 YT AdBlock + SponsorBlock install skipped.");
+                    snprintf(status, sizeof(status), "Settings saved, AdlessTube install skipped.");
                     statusIsError = false;
                 }
                 else
                 {
-                    snprintf(status, sizeof(status), "SponsorBlock Config saved; dialog failed: %.130s", errorText);
+                    snprintf(status, sizeof(status), "Settings saved, dialog failed: %.130s", errorText);
                     statusIsError = true;
                 }
             }
@@ -2491,53 +3262,111 @@ int main(void)
                 statusIsError = true;
             }
         }
-        scene->FrameBufferFill(black);
-        drawText(scene, "SponsorBlock Categories", titleFont, 150, 100, black, white);
-        drawText(scene, "YouTube AdBlock is always enabled.", menuFont, 150, 165, black, muted);
-
-        // Segment Skip Mode row.
-        int skipModeY = 250;
-        if (cursor == 0)
-            scene->DrawRectangle(135, skipModeY - 34, 1120, 43, accent);
-        char skipModeText[128];
-        snprintf(skipModeText, sizeof(skipModeText), "Segment Skip Mode: %s",
-                 skipModeAuto ? "Auto Skip" : "Ask for Confirmation");
-        drawText(scene, skipModeText, menuFont, 160, skipModeY, black,
-                 cursor == 0 ? white : muted);
-
-		// Categories selection rows.
-        for (int i = 0; i < CATEGORY_COUNT; ++i)
-        {
-            int y = 304 + i * 54;
-            if (i + 1 == cursor)
-                scene->DrawRectangle(135, y - 34, 1120, 43, accent);
-
-            char row[192];
-            snprintf(row, sizeof(row), "%s  %s  (%s)",
-                     selected[i] ? "[+]" : "[-]", categories[i].label, categories[i].id);
-            drawText(scene, row, menuFont, 160, y, black, i + 1 == cursor ? white : muted);
         }
+
+        scene->FrameBufferFill(black);
+        drawText(scene, "AdlessTube - AdBlock & SponsorBlock for YouTube", titleFont, 150, 100, black, white);
+        drawText(scene, "All these settings can now be configured directly in YouTube", menuFont, 150, 165, black, muted);
+
+		// Top right corner: app version and the uninstall option.
+        char versionText[64];
+        snprintf(versionText, sizeof(versionText), "Version: %s", APP_RELEASE_VERSION);
+        drawTextRightAligned(scene, versionText, smallFont, 1900, 30, black, muted);
+        drawText(scene, "OPTIONS: Uninstall All", smallFont, 1682, 60, black, muted);
+
+        // All three main settings share one horizontal row.
+        const int settingsRowY = 285;
+        if (cursor == 0)
+            scene->DrawRectangle(135, settingsRowY - 34, 645, 43, accent);
+        if (cursor == 1)
+            scene->DrawRectangle(805, settingsRowY - 34, 500, 43, accent);
+        if (cursor == 2)
+            scene->DrawRectangle(1375, settingsRowY - 34, 450, 43, accent);
+
+        char skipModeText[128];
+        char adBlockText[96];
+        char sponsorBlockText[96];
+        snprintf(skipModeText, sizeof(skipModeText), "Skip Mode: %s",
+                 skipMode == 1 ? "Auto Skip" :
+                 (skipMode == 2 ? "Auto without notifications" : "Ask for Confirmation"));
+        snprintf(adBlockText, sizeof(adBlockText), "AdBlock: %s",
+                 adBlockEnabled ? "ON" : "OFF");
+        snprintf(sponsorBlockText, sizeof(sponsorBlockText), "SponsorBlock: %s",
+                 sponsorBlockEnabled ? "ON" : "OFF");
+
+        drawText(scene, skipModeText, menuFont, 160, settingsRowY, black,
+                 cursor == 0 ? white : muted);
+        drawText(scene, adBlockText, menuFont, 830, settingsRowY, black,
+                 cursor == 1 ? white : muted);
+        drawText(scene, sponsorBlockText, menuFont, 1400, settingsRowY, black,
+                 cursor == 2 ? white : muted);
 
         int selectedCount = 0;
         for (int i = 0; i < CATEGORY_COUNT; ++i)
             if (selected[i]) ++selectedCount;
-        char countText[96];
-        snprintf(countText, sizeof(countText), "Selected: %d / %d", selectedCount, CATEGORY_COUNT);
-        drawText(scene, countText, menuFont, 1320, 255, black, green);
-        drawControllerIcon(scene, "arrows", 1325, 342);
-        drawText(scene, "Move through options", menuFont, 1370, 365, black, muted);
-        drawControllerIcon(scene, "square", 1325, 397);
-        drawText(scene, "Toggle category / skip mode", menuFont, 1370, 420, black, muted);
-        drawControllerIcon(scene, "triangle", 1325, 452);
-        drawText(scene, "Update categories", menuFont, 1370, 475, black, muted);
-        drawControllerIcon(scene, "cross", 1325, 508);
-        drawText(scene, "Save and install", menuFont, 1370, 530, black, muted);
-        drawText(scene, "OPTIONS: Uninstall All", smallFont, 1682, 1035, black, muted);
-        char versionText[64];
-        snprintf(versionText, sizeof(versionText), "Version: %s", APP_RELEASE_VERSION);
-        drawText(scene, versionText, smallFont, 1765, 1065, black, muted);
+        char countText[32];
+        snprintf(countText, sizeof(countText), "%d / %d", selectedCount, CATEGORY_COUNT);
+        // Keep the label fixed and right-align the changing count.
+        drawText(scene, "Selected:", menuFont, 1645, 165, black, green);
+        drawTextRightAligned(scene, countText, menuFont, 1900, 165, black, green);
+
+        // Show categories in two columns, six per column.
+        // Navigation stays linear: down the first column, then the second.
+        for (int i = 0; i < CATEGORY_COUNT; ++i)
+        {
+            const int column = i / 6;
+            const int rowIndex = i % 6;
+            const int x = column == 0 ? 160 : 960;
+            const int highlightX = column == 0 ? 135 : 935;
+            const int highlightWidth = column == 0 ? 760 : 850;
+            const int y = 400 + rowIndex * 64;
+
+            if (i + 3 == cursor)
+                scene->DrawRectangle(highlightX, y - 32, highlightWidth, 42, accent);
+
+            char row[192];
+            snprintf(row, sizeof(row), "%s (%s): %s",
+                     categories[i].label, categories[i].id,
+                     selected[i] ? "ON" : "OFF");
+            drawText(scene, row, categoryFont, x, y, black,
+                     i + 3 == cursor ? white : muted);
+        }
+
+        // Controller legend.
+        const char *legendLabels[] = { "Select", "Select all / Clear all", "Close App", "Install" };
+        const char *legendIcons[] = { "cross", "triangle", "circle", "square" };
+        const int legendTextGap = 8;
+        const int legendIconWidth = 28;
+        int legendGroupWidths[4];
+        int totalLegendWidth = 0;
+
+        for (int i = 0; i < 4; ++i)
+        {
+            legendGroupWidths[i] = legendIconWidth + legendTextGap + getTextWidth(legendLabels[i], legendFont);
+            totalLegendWidth += legendGroupWidths[i];
+        }
+
+        // Keep the gaps equal; outer margins are half the gap.
+        const int legendGap = (FRAME_WIDTH - totalLegendWidth) / 4;
+        const int legendOuterMargin = legendGap / 2;
+        int legendX = legendOuterMargin;
+        for (int i = 0; i < 4; ++i)
+        {
+            drawControllerIcon(scene, legendIcons[i], legendX, 1038);
+            drawText(scene, legendLabels[i], legendFont, legendX + legendIconWidth + legendTextGap,
+                     1060, black, muted);
+            legendX += legendGroupWidths[i] + legendGap;
+        }
+
         if (status[0] != '\0')
-            drawText(scene, status, menuFont, 150, 1000, black, statusIsError ? red : green);
+            drawText(scene, status, menuFont, 150, 955, black, statusIsError ? red : green);
+
+        if (exitRequested)
+        {
+            playClosingAnimation(scene, &frameID, black);
+            sceSystemServiceLoadExec("exit", NULL);
+            return 0;
+        }
 
         scene->SubmitFlip(frameID);
         scene->FrameWait(frameID);

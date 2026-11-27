@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- WARNING: These notes are visible to the end user! -->
+<changeinfo>
+  <changes app_ver="01.02">
+    <![CDATA[
+      Renamed the application and introduced a new logo.
+      Redesigned the UI.
+      Added a third skip mode: automatically skip segments without notifications.
+      Simplified category management.
+      Added options to enable or disable AdBlock and SponsorBlock.
+      Improved PRX update handling.
+    ]]>
+  </changes>
+  <changes app_ver="01.01">
+    <![CDATA[
+      Added FPKG update feature.
+      Added automatic checks for new versions.
+    ]]>
+  </changes>
+</changeinfo>
