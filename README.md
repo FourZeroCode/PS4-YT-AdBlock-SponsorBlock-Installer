@@ -1,27 +1,24 @@
-# PS4 YT AdBlock + SponsorBlock Installer
+# AdlessTube - AdBlock & SponsorBlock Installer
 
-A PS4 homebrew app for configuring SponsorBlock categories and installing/updating the YouTube AdBlock + SponsorBlock.
+A PS4 homebrew app for managing the AdlessTube YouTube plugin, including installation, updates, and SponsorBlock settings.
+
+Our PS4 Youtube ad block plugin is compatible with: YouTube v02.32 from pkg-zone.com (CUSA01015)
+
+For more information about AdlessTube - AdBlock & SponsorBlock for Youtube, visit our [GitHub page](https://github.com/FourZeroCode/ps4_yt_adsponsorblock).
 
 ## Features
+Block ads and sponsor segments on YouTube
 
+- Enable/Disable AdBlock
+- Enable/Disable SponsorBlock
 - Configure all 12 SponsorBlock categories.
-- Choose **Auto Skip** or **Ask for Confirmation** for segments.
+- Choose **Auto Skip**, **Silent Auto Skip** or **Ask for Confirmation** for segments.
 - Save settings to `/data/youtube/config.json`.
-- Download the latest PRX from [GitHub Releases](https://github.com/FourZeroCode/yt_adblock_sponsorblock_ps4/releases).
-- Fall back to the bundled PRX if the download fails.
+- Downloads the latest AdlessTube from [GitHub Releases](https://github.com/FourZeroCode/ps4_yt_adsponsorblock/releases).
 - Install/update the PRX and manage its GoldHEN `plugins.ini` entry.
 - Uninstall the managed plugin and SponsorBlock configuration.
 
-## Controls
-
-| Button | Action |
-| --- | --- |
-| D-pad Up / Down | Navigate the menu |
-| Square | Toggle the selected mode or category |
-| R2 | Select all categories, or clear all if already selected |
-| Triangle | Save SponsorBlock settings |
-| Cross | Save settings and install/update the PRX |
-| Options | Open the uninstall prompt |
+![AdlessTube](.github/images/adlesstube_ui.jpg)
 
 ## Build (Windows)
 
@@ -31,7 +28,7 @@ A PS4 homebrew app for configuring SponsorBlock categories and installing/updati
 4. From `SponsorBlockConfig/SponsorBlockConfig`, run:
 
    ```bat
-   .\build.bat .\x64\Debug "SponsorBlockConfig" "..\\"
+   .\build_standalone.bat .\x64\Debug "SponsorBlockConfig" "..\\"
    ```
 
 ## Credits
