@@ -6,11 +6,17 @@ if not defined OO_PS4_TOOLCHAIN (
 )
 
 Rem Package information
-set PKG_TITLE="PS4 YT AdBlock + SponsorBlock"
-set PKG_VERSION=
-for /f "tokens=3" %%A in ('findstr /b /c:"#define APP_RELEASE_VERSION" version.h') do set PKG_VERSION="%%~A"
-if not defined PKG_VERSION (
+set PKG_TITLE="AdlessTube"
+set APP_VERSION=
+for /f "tokens=3" %%A in ('findstr /b /c:"#define APP_RELEASE_VERSION" version.h') do set APP_VERSION="%%~A"
+if not defined APP_VERSION (
     echo ERROR: APP_RELEASE_VERSION is missing from version.h.
+    exit /b 1
+)
+set PKG_VERSION=
+for /f "tokens=3" %%A in ('findstr /b /c:"#define PKG_RELEASE_VERSION" version.h') do set PKG_VERSION="%%~A"
+if not defined PKG_VERSION (
+    echo ERROR: PKG_RELEASE_VERSION is missing from version.h.
     exit /b 1
 )
 set PKG_ASSETS="assets"
@@ -73,8 +79,9 @@ Rem Create param.sfo
 cd ..
 %OO_PS4_TOOLCHAIN%\bin\windows\PkgTool.Core.exe sfo_new sce_sys/param.sfo
 %OO_PS4_TOOLCHAIN%\bin\windows\PkgTool.Core.exe sfo_setentry sce_sys/param.sfo APP_TYPE --type Integer --maxsize 4 --value 1
-%OO_PS4_TOOLCHAIN%\bin\windows\PkgTool.Core.exe sfo_setentry sce_sys/param.sfo APP_VER --type Utf8 --maxsize 8 --value %PKG_VERSION%
+%OO_PS4_TOOLCHAIN%\bin\windows\PkgTool.Core.exe sfo_setentry sce_sys/param.sfo APP_VER --type Utf8 --maxsize 8 --value %APP_VERSION%
 %OO_PS4_TOOLCHAIN%\bin\windows\PkgTool.Core.exe sfo_setentry sce_sys/param.sfo ATTRIBUTE --type Integer --maxsize 4 --value 18
+%OO_PS4_TOOLCHAIN%\bin\windows\PkgTool.Core.exe sfo_setentry sce_sys/param.sfo ATTRIBUTE2 --type Integer --maxsize 4 --value 
 %OO_PS4_TOOLCHAIN%\bin\windows\PkgTool.Core.exe sfo_setentry sce_sys/param.sfo CATEGORY --type Utf8 --maxsize 4 --value "gde"
 %OO_PS4_TOOLCHAIN%\bin\windows\PkgTool.Core.exe sfo_setentry sce_sys/param.sfo CONTENT_ID --type Utf8 --maxsize 48 --value %PKG_CONTENT_ID%
 %OO_PS4_TOOLCHAIN%\bin\windows\PkgTool.Core.exe sfo_setentry sce_sys/param.sfo DOWNLOAD_DATA_SIZE --type Integer --maxsize 4 --value 0
@@ -82,6 +89,7 @@ cd ..
 %OO_PS4_TOOLCHAIN%\bin\windows\PkgTool.Core.exe sfo_setentry sce_sys/param.sfo TITLE --type Utf8 --maxsize 128 --value %PKG_TITLE%
 %OO_PS4_TOOLCHAIN%\bin\windows\PkgTool.Core.exe sfo_setentry sce_sys/param.sfo TITLE_ID --type Utf8 --maxsize 12 --value %PKG_TITLE_ID%
 %OO_PS4_TOOLCHAIN%\bin\windows\PkgTool.Core.exe sfo_setentry sce_sys/param.sfo VERSION --type Utf8 --maxsize 8 --value %PKG_VERSION%
+%OO_PS4_TOOLCHAIN%\bin\windows\PkgTool.Core.exe sfo_setentry sce_sys/param.sfo FORMAT --type Utf8 --maxsize 4 --value obs
 
 Rem Get a list of assets for packaging
 set module_files=
@@ -102,8 +110,15 @@ for %%f in (assets\\misc\\*) do set asset_misc_files=!asset_misc_files! assets/m
 set asset_videos_files=
 for %%f in (assets\\videos\\*) do set asset_videos_files=!asset_videos_files! assets/videos/%%~nxf
 
-Rem Create gp4
-%OO_PS4_TOOLCHAIN%\bin\windows\create-gp4.exe -out pkg.gp4 --content-id=%PKG_CONTENT_ID% --files "eboot.bin sce_sys/about/right.sprx sce_sys/param.sfo sce_sys/icon0.png %module_files% %asset_audio_files% %asset_fonts_files% %asset_images_files% %asset_misc_files% %asset_videos_files%"
+Rem Create gp4 only when it does not already exist.
+Rem create-gp4.exe regenerates pkg_standalone.gp4 and resets package metadata. Preserve
+Rem an existing GP4 so custom volume_type, storage_type, app_type, etc. survive.
+if not exist pkg_standalone.gp4 (
+    %OO_PS4_TOOLCHAIN%\bin\windows\create-gp4.exe -out pkg_standalone.gp4 --content-id=%PKG_CONTENT_ID% --files "eboot.bin sce_sys/about/right.sprx sce_sys/param.sfo sce_sys/changeinfo/changeinfo.xml sce_sys/icon0.png %module_files% %asset_audio_files% %asset_fonts_files% %asset_images_files% %asset_misc_files% %asset_videos_files%"
+    if errorlevel 1 exit /b 1
+) else (
+    echo Using existing pkg_standalone.gp4 - preserving your package metadata.
+)
 
 Rem Create pkg
-%OO_PS4_TOOLCHAIN%\bin\windows\PkgTool.Core.exe pkg_build pkg.gp4 .
+%OO_PS4_TOOLCHAIN%\bin\windows\PkgTool.Core.exe pkg_build pkg_standalone.gp4 .
